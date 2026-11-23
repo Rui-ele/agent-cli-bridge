@@ -46,7 +46,7 @@
 - 第 1 项：`steer`、`cancel`、`status` 三个短命令；第 3 步实测记录见 [experiments/2026-11-23-codex-import](experiments/2026-11-23-codex-import/README.md)。
 - 第 2 项：拆出驱动接口，现有三个驱动是 `codex-exec`、`codex-daemon`、`agy-print`。
 - 后两项也已装回。
-- 第 3 项：通用 ACP 驱动（`--to agy --backend acp`），写入由我们自己的 Seatbelt 沙箱限制。实测见 [experiments/2026-11-23-agy-acp](experiments/2026-11-23-agy-acp/README.md)。默认仍是 `agy -p`。
+- 第 3 项：通用 ACP 驱动（`--to agy --backend acp`），写入由我们自己的 Seatbelt 沙箱限制。实测见 [experiments/2026-11-23-agy-acp](experiments/2026-11-23-agy-acp/README.md)。默认仍是 `agy -p`。已装回。
 
 ## 第一个实验
 
