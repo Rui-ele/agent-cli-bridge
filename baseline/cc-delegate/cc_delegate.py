@@ -427,7 +427,7 @@ def daemon_socket():
     return root / "app-server-control/app-server-control.sock"
 
 
-def daemon_event(kind, **fields):
+def worker_event(kind, **fields):
     print(dumps({"type": kind, **fields}), flush=True)
 
 
@@ -522,13 +522,13 @@ class DaemonConnection:
             msg = await self.receive()
             if msg.get("id") == "name" and "method" not in msg:
                 if "error" in msg and self.log_events:
-                    daemon_event("thread.name_failed", error=msg["error"])
+                    worker_event("thread.name_failed", error=msg["error"])
                 continue
             if "id" not in msg or "method" not in msg:
                 return msg
             self.send({"id": msg["id"], "error": {"code": -32601, "message": "unsupported server request"}})
             if self.log_events:
-                daemon_event("server_request.rejected", method=msg["method"], id=msg["id"])
+                worker_event("server_request.rejected", method=msg["method"], id=msg["id"])
 
     async def request(self, method, params, notifications=None):
         self.request_id += 1
@@ -573,7 +573,7 @@ class DaemonTurn:
         if params.get("threadId") != self.thread or (params.get("turnId") or turn.get("id")) != self.turn:
             return
         if method == "turn/started":
-            daemon_event("turn.started")
+            worker_event("turn.started")
         elif method in ("item/started", "item/completed"):
             item = params["item"]
             kind = item["type"]
@@ -585,16 +585,16 @@ class DaemonTurn:
             elif kind == "commandExecution":
                 mapped.update(type="command_execution", command=item["command"],
                               exit_code=item.get("exitCode"), aggregated_output=item.get("aggregatedOutput"))
-            daemon_event(method.replace("/", "."), item=mapped)
+            worker_event(method.replace("/", "."), item=mapped)
         elif method == "thread/tokenUsage/updated":
             counts = params["tokenUsage"]["total"]
             self.usage = {re.sub(r"(?=[A-Z])", "_", k).lower(): v for k, v in counts.items()}
         elif method == "turn/completed":
             save_json(self.state_path, dict(self.state, turn_status=turn["status"]))
             if turn["status"] == "completed":
-                daemon_event("turn.completed", usage=self.usage)
+                worker_event("turn.completed", usage=self.usage)
                 return 0
-            daemon_event("turn.failed", error=turn.get("error") or turn["status"])
+            worker_event("turn.failed", error=turn.get("error") or turn["status"])
             return 1
 
     async def run(self, args, prompt):
@@ -616,7 +616,7 @@ class DaemonTurn:
         else:
             result = await self.conn.request("thread/start", dict(params, ephemeral=False))
         self.thread = result["thread"]["id"]
-        daemon_event("thread.started", thread_id=self.thread)
+        worker_event("thread.started", thread_id=self.thread)
         if args.thread_name:
             # Naming is cosmetic. A slow name acknowledgement must not delay the turn.
             self.conn.send({"id": "name", "method": "thread/name/set",
@@ -646,7 +646,7 @@ async def daemon_worker(args):
         try:
             conn = await asyncio.wait_for(DaemonConnection.connect(args.socket), 5)
         except (OSError, EOFError, ValueError, KeyError, asyncio.TimeoutError, asyncio.LimitOverrunError) as exc:
-            daemon_event("turn.failed", error=str(exc) or type(exc).__name__)
+            worker_event("turn.failed", error=str(exc) or type(exc).__name__)
             return DAEMON_UNAVAILABLE
         turn = DaemonTurn(conn, Path(args.o).parent / "daemon.json", args.socket)
         task = asyncio.create_task(turn.run(args, prompt))
@@ -670,7 +670,7 @@ async def daemon_worker(args):
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.remove_signal_handler(sig)
     except (OSError, ValueError, EOFError, KeyError, TypeError, Blocked, asyncio.CancelledError) as exc:
-        daemon_event("turn.failed", error=str(exc) or type(exc).__name__)
+        worker_event("turn.failed", error=str(exc) or type(exc).__name__)
         return 1
     finally:
         if conn:
@@ -714,6 +714,220 @@ def daemon_main(argv):
     return asyncio.run(daemon_worker(parser.parse_args(argv)))
 
 
+class AcpRequestError(ValueError):
+    """The agent answered an RPC with an error."""
+
+
+def acp_choices(options, key):
+    entries = next((o.get("options", []) for o in options if o["id"] == key), [])
+    return [item["value"] for entry in entries for item in entry.get("options", [entry])]
+
+
+class AcpTurn:
+    def __init__(self, proc, args):
+        self.proc, self.args = proc, args
+        self.session = None
+        self.request_id = 0
+        self.text = []
+        self.message_tail = ""
+        self.tools = {}
+        self.stopping = False
+
+    def send(self, **message):
+        self.proc.stdin.write((dumps({"jsonrpc": "2.0", **message}) + "\n").encode())
+
+    def permission(self, msg):
+        params = msg["params"]
+        kind = "allow_once" if self.args.mode == "write" else "reject_once"
+        pick = next((o for o in params["options"] if o["kind"] == kind), None)
+        outcome = {"outcome": "cancelled"}
+        if pick and (kind == "reject_once" or (params["sessionId"] == self.session and not self.stopping)):
+            outcome = {"outcome": "selected", "optionId": pick["optionId"]}
+        self.send(id=msg["id"], result={"outcome": outcome})
+        worker_event("permission.resolved", tool_call_id=params["toolCall"]["toolCallId"],
+                     decision=kind if "optionId" in outcome else "cancelled", outcome=outcome)
+
+    def update(self, update):
+        typ = update["sessionUpdate"]
+        if typ == "agent_message_chunk":
+            content = update["content"]
+            if content.get("type") == "text":
+                self.text.append(content["text"])
+                self.message_tail = (self.message_tail + content["text"])[-200:]
+                worker_event("item.updated", item=dict(type="agent_message", text=content["text"],
+                                                       preview=self.message_tail))
+        elif typ in ("tool_call", "tool_call_update"):
+            # ACP updates are sparse. The completion often contains only an ID and a status.
+            tid = update["toolCallId"]
+            tool = self.tools.setdefault(tid, {})
+            tool.update({k: v for k, v in update.items() if v is not None})
+            status = tool.get("status", "pending")
+            item = dict(id=tid, type="tool_call", kind=tool.get("kind"), title=tool.get("title"), status=status)
+            if item["kind"] == "execute":
+                raw = tool.get("rawInput")
+                params = raw if isinstance(raw, dict) else {}
+                command = raw if isinstance(raw, str) else (
+                    params.get("command") or params.get("CommandLine") or params.get("commandLine"))
+                if isinstance(command, list) and all(isinstance(arg, str) for arg in command):
+                    command = shlex.join(command)
+                result = tool.get("rawOutput")
+                code = result.get("exitCode", result.get("exit_code")) if isinstance(result, dict) else None
+                item.update(type="command_execution", command=command or tool.get("title"), exit_code=code,
+                            aggregated_output=result if result is not None else tool.get("content"))
+            event = "item.started" if typ == "tool_call" else "item.updated"
+            if status in ("completed", "failed"):
+                event = "item.completed"
+            worker_event(event, item=item)
+        else:
+            # Thinking and other live updates also reset the supervisor's silence timer.
+            worker_event("session.activity", update=typ)
+
+    async def request(self, method, **params):
+        if self.stopping:
+            raise asyncio.CancelledError()
+        self.request_id += 1
+        self.send(id=self.request_id, method=method, params=params)
+        await self.proc.stdin.drain()
+        while True:
+            line = await self.proc.stdout.readline()
+            if not line:
+                raise EOFError(f"{method}: ACP agent closed stdout")
+            msg = json.loads(line)
+            incoming = msg.get("method")
+            if incoming == "session/request_permission":
+                self.permission(msg)
+                await self.proc.stdin.drain()
+            elif incoming and "id" in msg:
+                self.send(id=msg["id"], error={"code": -32601, "message": "unsupported client method"})
+                await self.proc.stdin.drain()
+            elif incoming == "session/update" and method == "session/prompt":
+                if msg["params"]["sessionId"] == self.session:
+                    self.update(msg["params"]["update"])
+            elif not incoming and msg.get("id") == self.request_id:
+                if "error" in msg:
+                    raise AcpRequestError(f"{method}: {dumps(msg['error'])}")
+                return msg["result"]
+
+    async def configure(self, options):
+        args = self.args
+        models = acp_choices(options, "model")
+        model, effort = args.model, args.effort
+        base, sep, suffix = model.rpartition("-")
+        if model not in models and sep and suffix in args.model_suffixes.split(",") and base in models:
+            model, effort = base, effort or suffix
+        settings = [("model", model)]
+        if effort:
+            settings.append((args.effort_config, effort))
+        settings.append(("mode", args.agent_mode))
+        for key, value in settings:
+            choices = acp_choices(options, key)
+            if value not in choices:
+                raise ValueError(f"unknown {key} {value!r}, available: {', '.join(choices) or '(none)'}")
+            result = await self.request("session/set_config_option", sessionId=self.session, configId=key, value=value)
+            options = result.get("configOptions", options)
+
+    async def run(self, prompt):
+        caps = {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False}
+        init = await self.request("initialize", protocolVersion=1, clientCapabilities=caps)
+        if init.get("protocolVersion") != 1:
+            raise ValueError("unsupported ACP protocol version")
+        params = dict(cwd=self.args.cwd, mcpServers=[])
+        if self.args.resume:
+            self.session = params["sessionId"] = self.args.resume
+            try:
+                result = await self.request("session/resume", **params)
+            except AcpRequestError:
+                result = await self.request("session/load", **params)
+        else:
+            result = await self.request("session/new", **params)
+            self.session = result["sessionId"]
+        worker_event("session.started", session_id=self.session)
+        await self.configure(result.get("configOptions") or [])
+        prompt += "\n\n只输出一个符合以下 JSON schema 的 JSON 对象。\n" + dumps(SCHEMA)
+        result = await self.request("session/prompt", sessionId=self.session, prompt=[dict(type="text", text=prompt)])
+        if self.text:
+            worker_event("item.completed", item=dict(type="agent_message", text="".join(self.text)))
+        usage = result.get("usage")
+        if usage is not None:
+            usage = {re.sub(r"(?=[A-Z])", "_", k).lower(): v for k, v in usage.items()}
+        reason = result["stopReason"]
+        if reason != "end_turn" or self.stopping:
+            worker_event("turn.failed", error=reason if not self.stopping else "cancelled", usage=usage)
+            return 1
+        worker_event("turn.completed", usage=usage)
+        return 0
+
+
+async def acp_worker(args, prompt):
+    proc = turn = task = timer = None
+    stopping = False
+    loop = asyncio.get_running_loop()
+
+    def stop():
+        nonlocal stopping, timer
+        if stopping:
+            return
+        stopping = True
+        if turn:
+            turn.stopping = True
+            if turn.session:
+                timer = loop.call_later(5, task.cancel)
+                try:
+                    turn.send(method="session/cancel", params={"sessionId": turn.session})
+                except (BrokenPipeError, ConnectionResetError):
+                    task.cancel()
+            else:
+                task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop)
+    try:
+        # Group cancellation targets the worker. The agent needs to receive the ACP notification first.
+        proc = await asyncio.create_subprocess_exec(args.sandbox_exec, "-f", args.profile, *args.agent,
+                                                    cwd=args.cwd, start_new_session=True, stdin=subprocess.PIPE,
+                                                    stdout=subprocess.PIPE, limit=64 * 1024**2)
+        if stopping:
+            return 1
+        worker_event("agent.started", pid=proc.pid)
+        turn = AcpTurn(proc, args)
+        task = asyncio.create_task(turn.run(prompt))
+        return await task
+    except (OSError, ValueError, EOFError, KeyError, TypeError, asyncio.CancelledError) as exc:
+        worker_event("turn.failed", error=str(exc) or type(exc).__name__)
+        return 1
+    finally:
+        if timer:
+            timer.cancel()
+        if proc and proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if proc.returncode is None:
+                    proc.kill()
+            await proc.wait()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
+        if turn:
+            save_text(Path(args.o), "".join(turn.text))
+
+
+def acp_main(argv):
+    parser = argparse.ArgumentParser(prog="cc_delegate.py acp-worker")
+    parser.add_argument("--mode", choices=("ro", "write"), required=True)
+    for name in ("cwd", "agent-mode", "model", "profile"):
+        parser.add_argument("--" + name, required=True)
+    parser.add_argument("--sandbox-exec", default=str(SEATBELT))
+    parser.add_argument("--model-suffixes", default="")
+    parser.add_argument("--effort-config")
+    parser.add_argument("--effort")
+    parser.add_argument("--resume")
+    parser.add_argument("-o", required=True)
+    parser.add_argument("agent", nargs="+")
+    return asyncio.run(acp_worker(parser.parse_args(argv), sys.stdin.read()))
+
+
 UNSET = object()  # Some protocol fields explicitly clear a previous value with null.
 
 
@@ -743,6 +957,7 @@ class Driver:
     redispatch = None
     stall_seconds = None
     activity_log = None
+    reports_agent_pid = False
     steer = None
 
     def command(self, args, cwd, run_dir, writable):
@@ -753,6 +968,9 @@ class Driver:
 
     def decode(self, raw):
         raise NotImplementedError
+
+    def check_available(self):
+        pass
 
     def prepare_files(self, cwd, run_dir, mode, repo):
         pass
@@ -776,19 +994,7 @@ class Driver:
         """Optionally print live status beyond the local event log."""
 
 
-class CodexDriver(Driver):
-    def window(self, model):
-        cache = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser() / "models_cache.json"
-        try:
-            models = json.loads(safe_file(cache).read_text())["models"]
-            for entry in models:
-                size = entry.get("context_window")
-                if entry.get("slug") == model and type(size) is int and size > 0:
-                    return size, False
-        except (Blocked, OSError, ValueError, KeyError, TypeError, AttributeError):
-            pass
-        return 272_000, True
-
+class ItemEventDriver(Driver):
     def output(self, last, events):
         if last.is_file():
             with open(last, encoding="utf-8", errors="replace",
@@ -805,13 +1011,14 @@ class CodexDriver(Driver):
             event.usage = raw.get("usage")
         elif typ == "turn.failed":
             event.error = raw.get("error") or "turn_failed"
+            event.usage = raw.get("usage", UNSET)
 
         item = raw.get("item")
         if not isinstance(item, dict):
             return event
         kind = item.get("type")
         if kind == "agent_message":
-            event.message = item.get("text")
+            event.message = item.get("preview", item.get("text"))
             if typ == "item.completed":
                 event.reply = item.get("text", "")
         elif kind == "command_execution":
@@ -828,8 +1035,23 @@ class CodexDriver(Driver):
                     normalized = " ".join(shlex.split(command))
                 except ValueError:
                     normalized = command.strip()
-                event.action = action_key(normalized, [code, item.get("aggregated_output")])
+                event.action = action_key(normalized, [code if code is not None else item.get("status"),
+                                                       item.get("aggregated_output")])
         return event
+
+
+class CodexDriver(ItemEventDriver):
+    def window(self, model):
+        cache = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser() / "models_cache.json"
+        try:
+            models = json.loads(safe_file(cache).read_text())["models"]
+            for entry in models:
+                size = entry.get("context_window")
+                if entry.get("slug") == model and type(size) is int and size > 0:
+                    return size, False
+        except (Blocked, OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass
+        return 272_000, True
 
 
 class CodexExec(CodexDriver):
@@ -918,9 +1140,8 @@ class CodexDaemon(CodexDriver):
             print(f"daemon_unavailable={preview(exc, 200)}")
 
 
-class AgyPrint(Driver):
+class AgyDriver(Driver):
     redispatch = ("codex", "exec")
-    activity_log = "agy.log"
 
     @property
     def stall_seconds(self):
@@ -928,6 +1149,10 @@ class AgyPrint(Driver):
 
     def window(self, model):
         return AGY_WINDOWS.get(model, 200_000), True
+
+
+class AgyPrint(AgyDriver):
+    activity_log = "agy.log"
 
     def prepare_files(self, cwd, run_dir, mode, repo):
         save_json(run_dir / "settings.json", agy_settings(cwd, mode, repo))
@@ -997,13 +1222,54 @@ class AgyPrint(Driver):
         return event
 
 
-DRIVERS = {"codex": {"exec": CodexExec(), "daemon": CodexDaemon()}, "agy": {None: AgyPrint()}}
+SEATBELT = Path("/usr/bin/sandbox-exec")
+
+
+def seatbelt_profile(mode, cwd, writable, data_dirs):
+    roots = [*data_dirs, "/private/var/folders", "/dev"]
+    if os.getenv("TMPDIR"):
+        roots.append(os.environ["TMPDIR"])
+    if mode == "write":
+        roots.extend((cwd, *writable))
+    # Agents can read directly without client filesystem RPCs. This profile confines writes only.
+    paths = sorted({str(Path(root).expanduser().resolve()) for root in roots})
+    filters = "\n".join(f"    (subpath {dumps(path)})" for path in paths)
+    return f"(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{filters})\n"
+
+
+class AgyAcp(AgyDriver, ItemEventDriver):
+    backend = "acp"
+    reports_agent_pid = True
+
+    def check_available(self):
+        if sys.platform != "darwin" or not SEATBELT.is_file() or not os.access(SEATBELT, os.X_OK):
+            raise Blocked("os_sandbox_unavailable")
+
+    def command(self, args, cwd, run_dir, writable):
+        profile = run_dir / "sandbox.sb"
+        save_text(profile, seatbelt_profile(args.mode, cwd, writable, ["~/.gemini"]))
+        cmd = [sys.executable, str(Path(__file__).resolve()), "acp-worker",
+               "--cwd", str(cwd), "--mode", args.mode, "--agent-mode",
+               "plan" if args.mode == "ro" else "accept-edits", "--model", args.model,
+               "--effort-config", "thought_level", "--model-suffixes", "low,medium,high,xhigh",
+               "--sandbox-exec", str(SEATBELT), "--profile", str(profile), "-o", str(run_dir / "last.txt")]
+        if args.effort:
+            cmd += ["--effort", args.effort]
+        if args.resume:
+            cmd += ["--resume", args.resume]
+        return cmd + ["--", "agy", "acp"]
+
+
+DRIVERS = {"codex": {"exec": CodexExec(), "daemon": CodexDaemon()},
+           "agy": {None: AgyPrint(), "acp": AgyAcp()}}
 TASK_ID = re.compile(r"\d{8}-\d{6}-(?:" + "|".join(map(re.escape, DRIVERS)) + r")-[0-9a-f]{4}")
 
 
 def driver_for(worker, backend="exec"):
     choices = DRIVERS[worker]
-    return choices[None] if None in choices else choices[backend]
+    if worker == "agy" and backend in ("exec", "daemon"):
+        return choices[None]
+    return choices[backend]
 
 
 def select_driver(args, driver, meta):
@@ -1242,8 +1508,10 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
     roots = [run_dir] + ([cwd] if meta["worktree"] else [])
     prev = mtimes(roots)
     pending = {"stdout": bytearray(), "stderr": bytearray()}
+    monitor_pid = None
     with (run_dir / "events.jsonl").open("a", encoding="utf-8", buffering=1) as log:
         def line_received(channel, raw):
+            nonlocal monitor_pid
             value = raw.decode(errors="replace")
             try:
                 event = json.loads(value)
@@ -1251,6 +1519,8 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
                 event = None
             if channel == "stdout" and isinstance(event, dict):
                 log.write(dumps(event) + "\n")
+                if events.driver.reports_agent_pid and event.get("type") == "agent.started":
+                    monitor_pid = event["pid"]
                 warning = events.observe(event)
                 if warning:
                     log.write(dumps(warning) + "\n")
@@ -1268,8 +1538,10 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
         stalled = False
         activity_log = run_dir / events.driver.activity_log if events.driver.activity_log else None
         log_offset = 0
-        net = start_net_monitor(proc.pid)
-        meta["liveness"] = "output+files+network" if net else "output+files"
+        net = None
+        if not events.driver.reports_agent_pid:
+            monitor_pid = proc.pid
+        meta["liveness"] = "output+files"
         try:
             # start_new_session makes the child's PID its process group ID.
             meta.update(worker_pid=proc.pid, worker_pgid=proc.pid)
@@ -1282,14 +1554,19 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
                                           (proc.stderr, selectors.EVENT_READ, "stderr")]:
                     os.set_blocking(pipe.fileno(), False)
                     sel.register(pipe, event, name)
-                if net:
-                    sel.register(net[1], selectors.EVENT_READ, "net")
 
                 def worker_open():
                     # The network monitor never closes on its own; only worker pipes count.
                     return any(key.data != "net" for key in sel.get_map().values())
 
                 while worker_open() or peek_exit(proc.pid) is None:
+                    if monitor_pid is not None:
+                        net = start_net_monitor(monitor_pid)
+                        monitor_pid = None
+                        if net:
+                            sel.register(net[1], selectors.EVENT_READ, "net")
+                            meta["liveness"] = "output+files+network"
+                            save_json(run_dir / "meta.json", meta)
                     tick = min(1.0, stall / 4) if stall else 1.0
                     ready = sel.select(tick) if sel.get_map() else []
                     if not ready and not sel.get_map():
@@ -1703,6 +1980,7 @@ def run(args, driver, quiet=False):
         try:
             if not project.is_dir():
                 raise Blocked("project_dir_missing")
+            driver.check_available()
             path = session_path(project, args.cc_session)
             meta["cc_session"] = str(path) if path else None
             messages, meta["cc_cost_before"] = load_session(path, tier != "none")
@@ -2070,12 +2348,15 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["codex-daemon-worker"]:
         return daemon_main(argv[1:])
+    if argv[:1] == ["acp-worker"]:
+        return acp_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     r = commands.add_parser("run")
     r.add_argument("--to", required=True, choices=tuple(DRIVERS))
-    r.add_argument("--backend", choices=("exec", "daemon"),
-                   default=os.getenv("CC_DELEGATE_CODEX_BACKEND", "exec"), help="Codex backend")
+    r.add_argument("--backend", choices=("exec", "daemon", "acp"),
+                   help="Codex: exec or daemon. agy: exec (print) or acp. "
+                        "Defaults to CC_DELEGATE_<WORKER>_BACKEND or exec.")
     r.add_argument("--model", required=True)
     task = r.add_mutually_exclusive_group(required=True)
     task.add_argument("--task")
@@ -2111,10 +2392,12 @@ def main(argv=None):
     m.add_argument("--note", default="")
     args = parser.parse_args(argv)
     if args.command == "run":
+        env_key = f"CC_DELEGATE_{args.to.upper()}_BACKEND"
+        args.backend = args.backend or os.getenv(env_key, "exec")
         try:
             driver = driver_for(args.to, args.backend)
         except KeyError:
-            parser.error("CC_DELEGATE_CODEX_BACKEND must be exec or daemon")
+            parser.error(f"unsupported {args.to} backend: {args.backend}")
     try:
         return run_with_fallback(args, driver) if args.command == "run" else existing(args)
     except (OSError, ValueError, Blocked) as error:
