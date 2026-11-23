@@ -308,12 +308,13 @@ def package(task, messages, includes, tier, mode, size):
         return clean(value) if isinstance(value, str) else value
 
     pieces = [Piece("header", HEADER + f"\n执行模式：{mode}")]
+    # Includes are files the caller chose, not conversation, so even the "none" tier names them.
+    for p in includes:
+        p = safe_file(p)
+        with p.open(encoding="utf-8", errors="replace") as f:
+            snippet = clean(f.read(2000))
+        pieces.append(Piece("include", f"[文件] {clean(str(p))}\n" + "\n".join(snippet.splitlines()[:5])))
     if tier != "none":
-        for p in includes:
-            p = safe_file(p)
-            with p.open(encoding="utf-8", errors="replace") as f:
-                snippet = clean(f.read(2000))
-            pieces.append(Piece("include", f"[文件] {clean(str(p))}\n" + "\n".join(snippet.splitlines()[:5])))
         if tier == "scoped":
             rounds = [i for i, (r, bs) in enumerate(messages) if r == "user" and
                       any(b.get("type") == "text" and REMINDER.sub("", b.get("text", "")).strip()
@@ -2109,6 +2110,8 @@ def receipt(data):
         flags.append("isolation_breach")
     if data.get("outcome"):
         flags.append("outcome")
+    if data.get("fallback_skipped"):
+        flags.append("fallback_skipped")
     if data.get("fallback_from"):
         data = dict(data, fallback="agy 失败，已自动改派 Codex")
         flags += ["fallback", "fallback_from", "fallback_reason"]
@@ -2359,12 +2362,19 @@ def run_with_fallback(args, driver):
     """Redispatch is a new, separately accounted task, with its own checkout and session."""
     if not driver.redispatch or not args.fallback or args.dry_run:
         return run(args, driver)
+    # run() fills in derived fields such as args.base from --onto; the retry must start from
+    # what the caller asked for, or --onto plus the derived --base blocks it.
+    requested = dict(vars(args))
     code = run(args, driver, quiet=True)
     first = args.result
     if first["status"] not in ("outcome_unknown", "failed"):
         receipt(first)
         return code
-    retry = argparse.Namespace(**vars(args))
+    if args.resume:
+        # A follow-up refers to the agy session's earlier turns, which a fresh Codex thread lacks.
+        receipt(dict(first, fallback_skipped="resume_not_portable"))
+        return code
+    retry = argparse.Namespace(**requested)
     # The redispatched worker follows its own CC_DELEGATE_<TO>_BACKEND, so a daemon preference
     # also covers fallback runs; an unusable value must not cost the retry, so it degrades.
     retry.to = driver.redispatch[0]
@@ -2375,6 +2385,13 @@ def run_with_fallback(args, driver):
         retry.backend, retry.backend_source = driver.redispatch[1], "auto"
         redriver = driver_for(*driver.redispatch)
     retry.model, retry.resume = args.fallback_model, None
+    # agy browses on its own, so read-only agy tasks never carry --search; Codex needs it.
+    if args.mode == "ro":
+        retry.search = True
+    # agy encodes effort in the model name; carry it over instead of dropping to Codex's default.
+    suffix = re.search(r"-(low|medium|high|xhigh)$", args.model)
+    if not args.effort and suffix:
+        retry.effort = suffix.group(1)
     retry.fallback_from = first["task_id"]
     retry.fallback_reason = first.get("reason") or first["status"]
     return run(retry, redriver)

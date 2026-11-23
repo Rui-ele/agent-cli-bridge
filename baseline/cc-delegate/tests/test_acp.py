@@ -193,8 +193,10 @@ class AcpCase(unittest.TestCase):
         self.assertEqual(shlex.split((d / "command.txt").read_text())[:2], ["agy", "--input-format"])
 
     def codex_retry(self):
-        self.script(self.bin / "codex", "import sys\nfrom pathlib import Path\nsys.stdin.read()\n"
-                    "assert sys.argv[1] == 'exec'\nPath(sys.argv[sys.argv.index('-o')+1]).write_text("
+        self.script(self.bin / "codex", "import sys, json\nfrom pathlib import Path\nsys.stdin.read()\n"
+                    f"Path({str(self.root / 'codex-argv.json')!r}).write_text(json.dumps(sys.argv[1:]))\n"
+                    "assert sys.argv[1:3] in (['exec', '-s'], ['--search', 'exec'])\n"
+                    "Path(sys.argv[sys.argv.index('-o')+1]).write_text("
                     """'{"status":"ok","summary":[],"uncertainties":[],"report_markdown":"retry"}')""")
 
     def test_non_end_turn_redispatch(self):
@@ -216,8 +218,43 @@ class AcpCase(unittest.TestCase):
                 run_meta = json.loads((d / "meta.json").read_text())
                 self.assertEqual((meta["worker"], meta["backend"], meta["status"]), ("codex", "exec", "ok"))
                 # No daemon socket exists in the sandboxed CODEX_HOME, so the daemon choice degrades to exec.
+                # Read-only retries add --search, which the daemon backend hands to exec.
                 self.assertEqual(run_meta.get("backend_fallback"),
-                                 "daemon_unavailable" if value == "daemon" else None)
+                                 "search_unsupported_on_daemon" if value == "daemon" else None)
+
+    def codex_argv(self):
+        return json.loads((self.root / "codex-argv.json").read_text())
+
+    def test_redispatch_adds_search_and_effort_for_reads(self):
+        self.codex_retry()
+        with patch.dict(os.environ, {"ACP_STOP": "max_tokens"}):
+            _, meta = self.run_task(model="synthetic-high", fallback=True)
+        argv = self.codex_argv()
+        self.assertEqual((meta["worker"], argv[0]), ("codex", "--search"))
+        self.assertIn('model_reasoning_effort="high"', argv)
+
+    def test_redispatch_of_onto_write_is_not_blocked(self):
+        self.codex_retry()
+        cc.git(self.project, "init", "-q", "-b", "main")
+        cc.git(self.project, "-c", "user.name=fixture", "-c", "user.email=f@example.invalid",
+               "commit", "--allow-empty", "-qm", "base")
+        cc.git(self.project, "branch", "feature")
+        with patch.dict(os.environ, {"ACP_STOP": "max_tokens"}):
+            _, meta = self.run_task("--mode", "write", "--onto", "feature", fallback=True)
+        self.assertEqual((meta["worker"], meta.get("reason")), ("codex", None))
+        self.assertEqual(meta["onto"], "feature")
+        self.assertNotIn("--search", self.codex_argv())
+
+    def test_resume_is_not_redispatched(self):
+        self.codex_retry()
+        with patch.dict(os.environ, {"ACP_STOP": "max_tokens"}):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cc.main(["run", "--to", "agy", "--model", "synthetic", "--project-dir", str(self.project),
+                              "--cc-session", str(self.session), "--task", "follow up", "--resume", "old-session"])
+        self.assertNotEqual(rc, 0)
+        self.assertIn('fallback_skipped="resume_not_portable"', out.getvalue())
+        self.assertFalse((self.root / "codex-argv.json").exists())
 
     def test_stall_redispatch(self):
         self.codex_retry()
