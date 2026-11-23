@@ -260,15 +260,57 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
     def test_repo_locks(self):
         (cc.home() / "delegate-runs").mkdir(parents=True)
         with contextlib.ExitStack() as stack:
+            # Writers run in private clones, so several share a repository; one per --onto branch.
+            cc.slot(stack, self.project, self.project, "write", "feature")
+            with self.assertRaisesRegex(cc.Blocked, "onto_branch_busy"):
+                cc.slot(stack, self.project, self.project, "write", "feature")
+            cc.slot(stack, self.project, self.project, "write", "other")
             cc.slot(stack, self.project, self.project, "write")
-            with self.assertRaisesRegex(cc.Blocked, "writer_busy"):
+            cc.slot(stack, self.project, self.project, "write")
+            with self.assertRaisesRegex(cc.Blocked, "writers_busy"):
                 cc.slot(stack, self.project, self.project, "write")
             for _ in range(3):
                 cc.slot(stack, self.project, self.project, "ro")
             with self.assertRaisesRegex(cc.Blocked, "readers_busy"):
                 cc.slot(stack, self.project, self.project, "ro")
         with contextlib.ExitStack() as stack:
+            cc.slot(stack, self.project, self.project, "write", "feature")
+        with patch.dict(os.environ, {"CC_DELEGATE_MAX_READERS": "5", "CC_DELEGATE_MAX_WRITERS": "1"}), \
+                contextlib.ExitStack() as stack:
+            for _ in range(5):
+                cc.slot(stack, self.project, self.project, "ro")
+            with self.assertRaisesRegex(cc.Blocked, "readers_busy"):
+                cc.slot(stack, self.project, self.project, "ro")
             cc.slot(stack, self.project, self.project, "write")
+            with self.assertRaisesRegex(cc.Blocked, "writers_busy"):
+                cc.slot(stack, self.project, self.project, "write")
+        with patch.dict(os.environ, {"CC_DELEGATE_MAX_READERS": "zero"}), contextlib.ExitStack() as stack:
+            for _ in range(3):  # unparsable limits fall back to the default
+                cc.slot(stack, self.project, self.project, "ro")
+            with self.assertRaisesRegex(cc.Blocked, "readers_busy"):
+                cc.slot(stack, self.project, self.project, "ro")
+
+    def test_breaches_ignore_only_sibling_landings(self):
+        state = lambda head, refs, branch="refs/heads/feature": {
+            "head": head, "branch": branch, "status": "s", "refs": refs}
+        before = state("a", {"refs/heads/feature": "a", "refs/heads/other": "x"})
+        chain = [{"ref": "refs/heads/feature", "old": "a", "new": "b"},
+                 {"ref": "refs/heads/feature", "old": "b", "new": "c"}]
+        # The checked-out branch fast-forwarded twice by siblings: HEAD moves with it.
+        self.assertEqual(cc.breaches(before, state("c", {"refs/heads/feature": "c", "refs/heads/other": "x"}),
+                                     chain), [])
+        # Same end state with no landing on record: the worker did it.
+        self.assertEqual(cc.breaches(before, state("c", {"refs/heads/feature": "c", "refs/heads/other": "x"}),
+                                     []), ["head", "refs"])
+        # A landing explains one ref; a new branch alongside it is still flagged.
+        after = state("c", {"refs/heads/feature": "c", "refs/heads/other": "x", "refs/heads/escaped": "c"})
+        self.assertEqual(cc.breaches(before, after, chain), ["refs"])
+        # A landing that does not start from the snapshot value explains nothing.
+        self.assertEqual(cc.breaches(before, state("a", {"refs/heads/feature": "a", "refs/heads/other": "y"}),
+                                     [{"ref": "refs/heads/other", "old": "w", "new": "y"}]), ["refs"])
+        # Switching branches is never a sibling's doing.
+        self.assertEqual(cc.breaches(before, state("x", before["refs"], "refs/heads/other"), chain),
+                         ["branch", "head"])
 
     def test_concurrent_jsonl_appends(self):
         cc.home().mkdir()
@@ -432,6 +474,44 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
                              (["--onto", "feature", "--base", "main"], "onto_and_base_conflict")):
             d, data = self.run_task("--mode", "write", *args, expected=1)
             self.assertEqual(data["reason"], reason)
+
+    def test_parallel_writers_land_without_false_breach(self):
+        self.commit_fixture()
+        for b in ("fast", "slow"):
+            cc.git(self.project, "branch", b)
+        cc.git(self.project, "checkout", "-q", "fast")  # the fast task fast-forwards the checkout
+        (cc.home() / "delegate-runs").mkdir(parents=True)
+        self.worker("codex", """
+prompt = sys.stdin.read()
+import subprocess
+slow = "SLOW" in prompt
+time.sleep(2.5 if slow else 0.3)
+Path("a").write_text(Path("a").read_text() + ("slow\\n" if slow else "fast\\n"))
+subprocess.run(["git","-c","user.name=W","-c","user.email=w@x.invalid","commit","-qam","w"], check=True)
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) + "))\n")
+        script = Path(cc.__file__).resolve()
+        procs = [subprocess.Popen([sys.executable, str(script), "run", "--to", "codex", "--model", "synthetic",
+                                   "--cc-session", str(self.session), "--project-dir", str(self.project),
+                                   "--mode", "write", "--onto", b, "--task", task],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for b, task in (("slow", "SLOW 验收"), ("fast", "验收"))]
+        results = {}
+        for p, b in zip(procs, ("slow", "fast")):
+            out, err = p.communicate(timeout=60)
+            self.assertEqual(p.returncode, 0, out + err)
+            run_dir = Path(json.loads(out.splitlines()[-1].split("=", 1)[1]))
+            results[b] = json.loads((run_dir / "result.json").read_text())
+        fast, slow = results["fast"], results["slow"]
+        self.assertLess(fast["finished_at"], slow["finished_at"])
+        for b, data in results.items():
+            self.assertEqual(data["status"], "ok", data)
+            self.assertNotIn("isolation_breach", data)
+            self.assertEqual(cc.git(self.project, "rev-parse", b).strip(), data["onto_after"])
+        self.assertEqual((self.project / "a").read_text(), "before\nfast\n")
+        self.assertEqual(cc.git(self.project, "show", "slow:a"), "before\nslow\n")
+        landings = cc.landings_since(Path(cc.git(self.project, "rev-parse", "--path-format=absolute",
+                                                 "--git-common-dir").strip()), 0)
+        self.assertEqual(sorted(e["ref"] for e in landings), ["refs/heads/fast", "refs/heads/slow"])
 
     def test_agy_failure_falls_back_to_codex(self):
         self.worker("agy", "sys.stdin.read()\nsys.exit(3)\n")

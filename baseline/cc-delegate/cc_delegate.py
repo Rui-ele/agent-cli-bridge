@@ -906,16 +906,77 @@ def lock(stack, path, blocking=False):
     return True
 
 
-def slot(stack, project, common, mode):
+def env_limit(name, default):
+    try:
+        value = int(os.getenv(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def slot(stack, project, common, mode, onto=None):
+    """Per-repository task slots. Writers each get a private clone, so several may run at once;
+    only one may target a given --onto branch, because the second could never fast-forward."""
+    key = hashlib.sha256(os.fsencode(common or project)).hexdigest()[:24]
+    pool = home() / "delegate-runs" / ".locks"
+    pool.mkdir(exist_ok=True)
     if mode == "write":
-        if not lock(stack, common / "cc-delegate.lock"):
-            raise Blocked("repository_writer_busy")
-    else:
-        key = hashlib.sha256(os.fsencode(common or project)).hexdigest()[:24]
-        pool = home() / "delegate-runs" / ".locks"
-        pool.mkdir(exist_ok=True)
-        if not any(lock(stack, pool / f"{key}-{i}") for i in range(3)):
-            raise Blocked("repository_readers_busy")
+        if onto:
+            branch_key = hashlib.sha256(onto.encode()).hexdigest()[:16]
+            if not lock(stack, common / f"cc-delegate-onto-{branch_key}.lock"):
+                raise Blocked("onto_branch_busy")
+        if not any(lock(stack, pool / f"{key}-w{i}") for i in range(env_limit("CC_DELEGATE_MAX_WRITERS", 4))):
+            raise Blocked("repository_writers_busy")
+    elif not any(lock(stack, pool / f"{key}-{i}") for i in range(env_limit("CC_DELEGATE_MAX_READERS", 3))):
+        raise Blocked("repository_readers_busy")
+
+
+# Sibling write tasks land their --onto branches while this one runs; they record each
+# move here so this task's isolation check can tell those apart from its own worker's.
+LANDINGS = "cc-delegate-landings.jsonl"
+
+
+def record_landing(common, entry):
+    with open(common / LANDINGS, "a", encoding="utf-8") as f:
+        f.write(dumps(entry) + "\n")
+
+
+def landings_since(common, since):
+    try:
+        lines = (common / LANDINGS).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("at"), (int, float)) and entry["at"] >= since:
+            out.append(entry)
+    return out
+
+
+def breaches(before, after, landings):
+    """Which parts of the user's checkout changed in a way no sibling landing explains."""
+    def landed(ref, old, new):
+        cur = old
+        for e in landings:
+            if e.get("ref") == ref and e.get("old") == cur:
+                cur = e.get("new")
+        return old is not None and cur != old and cur == new
+
+    out = {k for k in ("branch", "status") if before[k] != after[k]}
+    moved = {r for r in before["refs"].keys() | after["refs"].keys()
+             if before["refs"].get(r) != after["refs"].get(r)}
+    unexplained = {r for r in moved if not landed(r, before["refs"].get(r), after["refs"].get(r))}
+    if unexplained:
+        out.add("refs")
+    branch = before["branch"]
+    if before["head"] != after["head"] and not (branch and branch == after["branch"]
+                                                and branch in moved and branch not in unexplained):
+        out.add("head")
+    return sorted(out)
 
 
 # Git config inside the worker's checkout is worker-controlled; never let it run programs.
@@ -945,11 +1006,12 @@ def diff_info(worktree, base):
 
 def checkout_state(repo):
     """What a write task must never change in the user's checkout: branch, refs, worktree."""
-    refs = [row for row in git(repo, "for-each-ref", "--format=%(refname) %(objectname)").splitlines()
-            if not row.startswith("refs/heads/delegate/")]
+    refs = dict(row.split(" ", 1)[::-1] for row in
+                git(repo, "for-each-ref", "--format=%(objectname) %(refname)").splitlines()
+                if row and not row.split(" ", 1)[1].startswith("refs/heads/delegate/"))
     return {"head": git(repo, "rev-parse", "HEAD", check=False).strip(),
             "branch": git(repo, "symbolic-ref", "-q", "HEAD", check=False).strip(),
-            "refs": hashlib.sha256("\n".join(refs).encode()).hexdigest(),
+            "refs": refs,
             "status": hashlib.sha256(git(repo, "status", "--porcelain=v1", "-z",
                                          "--untracked-files=all").encode()).hexdigest()}
 
@@ -968,7 +1030,7 @@ def isolated_checkout(repo, cwd, gitdir, branch, base):
 PROTECTED_BRANCHES = ("main", "master")
 
 
-def land(repo, meta, reply):
+def land(repo, common, meta, reply):
     """Fast-forward the user's chosen branch to the delegate branch; nothing else moves."""
     onto, old = meta["onto"], meta["onto_before"]
     new = git(repo, "rev-parse", f"refs/heads/delegate/{meta['task_id']}").strip()
@@ -993,6 +1055,8 @@ def land(repo, meta, reply):
     else:
         git(repo, "update-ref", f"refs/heads/{onto}", new, old)
     meta["onto_after"] = new
+    record_landing(common, {"ref": f"refs/heads/{onto}", "old": old, "new": new,
+                            "task_id": meta["task_id"], "at": time.time()})
 
 
 LOG_FIELDS = ("task_id", "worker", "model", "context", "package_tokens_est", "mode", "status",
@@ -1136,9 +1200,13 @@ def run(args, quiet=False):
                 gitdir, scratch = area / f".git-{task_id}", area / f".tmp-{task_id}"
                 writable = (gitdir, scratch)
             if not args.dry_run:
-                slot(stack, project, common, args.mode)
+                slot(stack, project, common, args.mode, args.onto)
                 if args.mode == "write":
-                    before = checkout_state(Path(repo))
+                    with ExitStack() as publish:
+                        # Never snapshot halfway through a sibling task's fetch or landing.
+                        lock(publish, common / "cc-delegate-publish.lock", blocking=True)
+                        watch_from = time.time()
+                        before = checkout_state(Path(repo))
                     area.mkdir(exist_ok=True)
                     scratch.mkdir()
                     isolated_checkout(Path(repo), cwd, gitdir, f"delegate/{task_id}", meta["base_sha"])
@@ -1199,21 +1267,24 @@ def run(args, quiet=False):
             reply["uncertainties"].append("group_cleanup_unconfirmed")
         if worktree:
             try:
-                after = checkout_state(Path(repo))
-                breach = sorted(k for k in before if before[k] != after[k])
-                if breach:
-                    # The user may also have edited the checkout meanwhile; flag it either way.
-                    meta["isolation_breach"] = breach
-                    reply["uncertainties"].append("isolation_breach:" + ",".join(breach))
-                    if meta["status"] == "ok":
-                        meta["status"] = "partial"
-                # Publish the private branch into the user's repository for review.
-                # Take whatever the worker left checked out, even if it switched branches.
-                git(Path(repo), *UNTRUSTED, "fetch", "-q", "--no-tags", str(worktree),
-                    f"+HEAD:refs/heads/delegate/{task_id}")
-                meta["changed_files"], meta["diff_stat"] = diff_info(worktree, meta["base_sha"])
-                if meta.get("onto"):
-                    land(Path(repo), meta, reply)
+                with ExitStack() as publish:
+                    # Sibling write tasks fetch and land into the same repository; one at a time.
+                    lock(publish, common / "cc-delegate-publish.lock", blocking=True)
+                    after = checkout_state(Path(repo))
+                    breach = breaches(before, after, landings_since(common, watch_from))
+                    if breach:
+                        # The user may also have edited the checkout meanwhile; flag it either way.
+                        meta["isolation_breach"] = breach
+                        reply["uncertainties"].append("isolation_breach:" + ",".join(breach))
+                        if meta["status"] == "ok":
+                            meta["status"] = "partial"
+                    # Publish the private branch into the user's repository for review.
+                    # Take whatever the worker left checked out, even if it switched branches.
+                    git(Path(repo), *UNTRUSTED, "fetch", "-q", "--no-tags", str(worktree),
+                        f"+HEAD:refs/heads/delegate/{task_id}")
+                    meta["changed_files"], meta["diff_stat"] = diff_info(worktree, meta["base_sha"])
+                    if meta.get("onto"):
+                        land(Path(repo), common, meta, reply)
             except (OSError, Blocked) as error:
                 meta["status"] = "outcome_unknown"
                 meta.setdefault("reason", "diff_collection_failed")
