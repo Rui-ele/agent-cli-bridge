@@ -453,36 +453,30 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
             self.assertEqual(cc.main(["run", "--to", "agy", "--model", "m", "--cc-session", str(self.session),
                                       "--project-dir", str(self.project), "--task", "x", "--no-fallback"]), 2)
 
-    def test_agy_stuck_only_after_repeated_retries_without_progress(self):
+    def test_agy_stuck_only_after_silence(self):
         body = """
 sys.stdin.read()
 log = Path(sys.argv[sys.argv.index("--log-file")+1])
-def request():
+for _ in range(REQUESTS):  # a subagent's rapid requests: no step events in between
     with log.open("a") as f:
-        f.write(time.strftime("I%%m%%d %%H:%%M:%%S.") + "%%06d" %% (time.time() %% 1 * 1e6) + " 1 http_helpers.go] URL: https://x/v1internal:streamGenerateContent?alt=sse\\n")
-    time.sleep(0.3)
-step = {"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE"}}
-for _ in range(ROUNDS):
-    request(); request()
-    print(json.dumps(step), flush=True)
-    time.sleep(0.5)  # real retries are minutes apart from the last step
-for _ in range(TAIL):
-    request()
+        f.write("I1122 23:34:20.896429 1 http_helpers.go] URL: https://x/v1internal:streamGenerateContent?alt=sse\\n")
+    time.sleep(0.5)
 if os.environ.get("HANG"):
     time.sleep(60)
 print(json.dumps({"event":"result","result":{"structured_output":""" + repr(ANSWER) + """}}))
 """
-        # Long runs with progress between requests are fine, with no time limit.
-        self.worker("agy", "ROUNDS, TAIL = 4, 2\n" + body % ())
-        d, data = self.run_task(worker="agy")
-        self.assertEqual(data["status"], "ok")
-        # Three requests in a row without a step = two retries: stuck.
-        self.worker("agy", "ROUNDS, TAIL = 1, 3\n" + body % ())
-        started = time.monotonic()
-        with patch.dict(os.environ, {"HANG": "1"}):
-            d, data = self.run_task(worker="agy", expected=2)
-        self.assertLess(time.monotonic() - started, 30)
-        self.assertEqual((data["reason"], data["stall_reason"]), ("stalled", "model_retries_without_progress"))
+        with patch.object(cc, "AGY_STALL_SECONDS", 3):
+            # Many requests without a step, longer than the stall limit in total: not stuck.
+            self.worker("agy", "REQUESTS = 10\n" + body)
+            d, data = self.run_task(worker="agy")
+            self.assertEqual(data["status"], "ok")
+            # Silence past the limit: stuck.
+            self.worker("agy", "REQUESTS = 1\n" + body)
+            started = time.monotonic()
+            with patch.dict(os.environ, {"HANG": "1"}):
+                d, data = self.run_task(worker="agy", expected=2)
+            self.assertLess(time.monotonic() - started, 30)
+            self.assertEqual((data["reason"], data["stall_reason"]), ("stalled", "no_activity_for_stall_seconds"))
 
     def test_repeated_verification_is_not_a_loop(self):
         events = cc.WorkerEvents("codex")

@@ -24,10 +24,12 @@ import time
 RESERVE_RATIO = 0.5
 TERM_GRACE = 10
 LOOP_REPEATS = 3
-# No wall-clock stall by default: a task may run as long as it makes progress.
-# agy is judged stuck when its own log shows this many model-request retries in a row
-# with no step progress in between (observed: a silent request is retried after ~9 min).
-AGY_RETRY_LIMIT = 2
+# codex exits on its own stream timeout, so it gets no wall-clock stall by default.
+# agy can hang silently (observed: a request with no reply, re-sent only after ~9 min).
+# It is judged stuck only after this long with no output, log line, file change or
+# network bytes. Counting requests misfired: a subagent's normal, rapid requests are
+# not step events in the parent stream.
+AGY_STALL_SECONDS = 600
 AGY_WINDOWS = {f"gemini-3.8-flash-{level}": 1_048_576
                for level in ("low", "medium", "high")}
 TASK_ID = re.compile(r"\d{8}-\d{6}-(?:codex|agy)-[0-9a-f]{4}")
@@ -503,26 +505,6 @@ class WorkerEvents:
         self.loop_warning = False
         self.last_action = None
         self.streak = 0
-        self.requests_since_step = 0
-        self.last_step = time.time()
-
-    def model_requests(self, chunk):
-        """Count agy model requests logged after the last step; True once retries exceed the limit.
-
-        The log and the event stream are separate pipes, so order them by the log's own
-        timestamps (glog: I1122 15:09:05.589537) rather than by when each is read.
-        """
-        for line in chunk.decode(errors="replace").splitlines():
-            if "streamGenerateContent" not in line:
-                continue
-            m = re.match(r"[IWE](\d\d)(\d\d) (\d\d):(\d\d):(\d\d(?:\.\d+)?)", line)
-            if m:
-                stamp = datetime.now().replace(month=int(m[1]), day=int(m[2]), hour=int(m[3]),
-                                               minute=int(m[4]), second=0, microsecond=0)
-                if stamp.timestamp() + float(m[5]) <= self.last_step:
-                    continue
-            self.requests_since_step += 1
-        return self.requests_since_step > AGY_RETRY_LIMIT
 
     def action(self, key):
         """Warn when the same action repeats LOOP_REPEATS times in a row with the same outcome.
@@ -545,7 +527,6 @@ class WorkerEvents:
             kind = event.get("event")
             step = event.get("step_update")
             if kind == "step_update" and isinstance(step, dict):
-                self.requests_since_step, self.last_step = 0, time.time()
                 if step.get("step_type") == "tool" and step.get("state") in ("DONE", "ERROR"):
                     info = step.get("tool_info") if isinstance(step.get("tool_info"), dict) else {}
                     outcome = dumps([step.get("state"), info.get("output"), info.get("error")])
@@ -853,10 +834,6 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
                         log_offset += len(chunk)
                         if chunk:
                             last_activity = current
-                            if events.model_requests(chunk):
-                                stalled = True
-                                meta["stall_reason"] = "model_retries_without_progress"
-                                break
                     if not stall:
                         continue
                     if current - last_scan >= min(stall / 4, 2) or current - last_activity >= stall:
@@ -1176,7 +1153,7 @@ def run(args, quiet=False):
                 meta["status"] = "dry_run"
                 reply["summary"] = ["已生成调用命令和上下文包。"]
             else:
-                stall = args.stall_seconds
+                stall = args.stall_seconds or (AGY_STALL_SECONDS if args.to == "agy" else None)
                 env = dict(os.environ, TMPDIR=str(scratch)) if worktree else None
                 rc, stalled = supervise(cmd, cwd, d, prompt, meta, stall, events, finish, env)
                 if stalled or rc or events.error:
