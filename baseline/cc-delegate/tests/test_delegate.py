@@ -241,6 +241,8 @@ class DelegateCase(unittest.TestCase):
                                       "GIT_CONFIG_NOSYSTEM": "1", "TMPDIR": str(self.root)})
         env.start()
         self.addCleanup(env.stop)
+        for name in ("codex", "agy"):
+            self.worker(name, "sys.exit(19)")
         self.session = self.root / "synthetic.jsonl"
         self.session.touch()
 
@@ -812,7 +814,7 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
     def test_blocked_overflow_write_without_git_and_unknown_task(self):
         self.write_rows([{"type": "user", "message": {"content": "X"*3000}}])
         with patch.object(cc.CodexExec, "window", return_value=(500, True)):
-            d, data = self.run_task(expected=1)
+            d, data = self.run_task("--context", "session", expected=1)
         self.assertEqual(data["reason"], "context_overflow")
         self.assertEqual(data["status"], "blocked")
         self.assertFalse((d / "command.txt").exists())
@@ -1056,6 +1058,54 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
             expected.append((f"refs/heads/delegate/{data['task_id']}", None, data["onto_after"]))
         self.assertCountEqual([(e["ref"], e["old"], e["new"]) for e in landings], expected)
 
+    def test_default_context_and_agy_print_alias(self):
+        self.write_rows([{"type": "user", "message": {"content": "private fixture conversation"}}])
+        d, meta = self.run_task("--backend", "print", "--dry-run", worker="agy")
+        self.assertEqual(meta["context"], "none")
+        self.assertNotIn("private fixture conversation", (d / "package.md").read_text())
+        self.assertIn("--print-timeout", (d / "command.txt").read_text())
+
+    def test_fallback_environment_and_default_receipt(self):
+        self.worker("agy", "sys.stdin.read(); sys.exit(3)")
+        self.worker("codex", 'sys.stdin.read()\nPath(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps('
+                    + repr(ANSWER) + '))')
+        argv = ["run", "--to", "agy", "--model", "m", "--project-dir", str(self.project),
+                "--cc-session", str(self.session), "--task", "x"]
+        for env, flags, worker in (("", [], "agy"), ("1", [], "codex"), ("1", ["--no-fallback"], "agy")):
+            out = io.StringIO()
+            with patch.dict(os.environ, CC_DELEGATE_AGY_FALLBACK=env), contextlib.redirect_stdout(out):
+                self.assertEqual(cc.main(argv + flags), 0 if worker == "codex" else 2)
+            d = Path(json.loads(out.getvalue().splitlines()[-1].split("=", 1)[1]))
+            self.assertEqual(json.loads((d / "result.json").read_text())["worker"], worker)
+
+    def test_missing_cli_fails_before_clone(self):
+        self.commit_fixture()
+        with patch.object(cc.shutil, "which", return_value=None), patch.object(cc, "seatbelt_available", return_value=True):
+            for worker, backend in (("codex", "exec"), ("agy", "exec"), ("agy", "acp")):
+                _, meta = self.run_task("--mode", "write", "--backend", backend, worker=worker, expected=1)
+                self.assertEqual(meta["reason"], worker + " executable not found in PATH")
+                self.assertFalse(cc.clone_root(self.project).exists())
+            self.run_task("--backend", "daemon", "--dry-run")
+
+    def test_onto_rechecks_worktrees_and_ancestry(self):
+        self.commit_fixture()
+        ancestor = cc.git(self.project, "rev-parse", "HEAD").strip()
+        cc.git(self.project, "-c", "user.name=W", "-c", "user.email=w@example.invalid",
+               "commit", "--allow-empty", "-qm", "later")
+        old = cc.git(self.project, "rev-parse", "HEAD").strip()
+        cc.git(self.project, "branch", "feature")
+        meta = dict(onto="feature", onto_before=old, status="ok")
+        reply = dict(uncertainties=[])
+        cc.land(self.project, self.project / ".git", meta, reply, ancestor)
+        self.assertEqual(reply["uncertainties"], ["onto_not_fast_forward"])
+        cc.git(self.project, "worktree", "add", "-q", str(self.root / "other"), "feature")
+        _, blocked = self.run_task("--mode", "write", "--onto", "feature", expected=1)
+        self.assertEqual(blocked["reason"], "onto_checked_out_elsewhere")
+        self.assertFalse(cc.clone_root(self.project).exists())
+        cc.land(self.project, self.project / ".git", meta, reply, old)
+        self.assertEqual(reply["uncertainties"][-1], "onto_checked_out_elsewhere")
+        self.assertEqual(cc.git(self.project, "rev-parse", "feature").strip(), old)
+
     def test_agy_failure_falls_back_to_codex(self):
         self.worker("agy", "sys.stdin.read()\nsys.exit(3)\n")
         self.worker("codex", "sys.stdin.read()\nassert '--resume' not in sys.argv\n"
@@ -1063,7 +1113,7 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = cc.main(["run", "--to", "agy", "--model", "m", "--cc-session", str(self.session),
-                            "--project-dir", str(self.project), "--task", "验收", "--context", "none"])
+                            "--project-dir", str(self.project), "--task", "验收", "--context", "none", "--fallback"])
         out = buf.getvalue()
         self.assertEqual(code, 0, out)
         self.assertLessEqual(len(out.splitlines()), 15)

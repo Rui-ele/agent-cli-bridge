@@ -35,8 +35,10 @@ class PruneCase(unittest.TestCase):
         (d / ".result.lock").touch()
         tree = self.root / ".wt-delegate" / d.name
         if clone:
-            for prefix in ("", ".git-", ".tmp-"):
-                (tree.parent / (prefix + d.name)).mkdir(parents=True)
+            tree.parent.mkdir(exist_ok=True)
+            cc.isolated_checkout(self.repo, tree, tree.parent / (".git-" + d.name),
+                                 "delegate/" + d.name, self.base)
+            (tree.parent / (".tmp-" + d.name)).mkdir()
         meta = dict(task_id=d.name, project_dir=str(self.repo), worktree=str(tree) if clone else None,
                     base_sha=self.base, status="running")
         if finished:
@@ -96,6 +98,36 @@ class PruneCase(unittest.TestCase):
         self.assertEqual(list((self.root / ".wt-delegate").iterdir()), [])
         self.assertEqual(list(self.runs.iterdir()), [])
 
+    def test_preserves_unsaved_work_and_receipts(self):
+        dirty, unique, clean = (self.make_run(clone=True) for _ in range(3))
+        area = cc.clone_root(self.repo)
+        (area / dirty.name / "notes").write_text("draft")
+        cc.git(area / unique.name, "checkout", "-qb", "local")
+        cc.git(area / unique.name, "commit", "--allow-empty", "-qm", "only here")
+        cc.git(area / unique.name, "checkout", "-q", "delegate/" + unique.name)
+        for flags in (["--dry-run"], []):
+            result = self.prune(*flags)
+            self.assertEqual(result["kept_clones"], [
+                dict(task_id=dirty.name, reason="uncommitted_changes"),
+                dict(task_id=unique.name, reason="unique_commits")])
+            self.assertEqual((result["clones"], result["runs"]), (1, 1))
+            for d in (dirty, unique):
+                self.assertTrue((d / "result.json").exists() and (area / d.name).is_dir())
+            self.assertEqual((area / clean.name).exists(), bool(flags))
+
+    def test_prune_after_saving_work_on_delegate_branch(self):
+        d = self.make_run(clone=True)
+        clone = cc.clone_root(self.repo) / d.name
+        (clone / "file").write_text("draft")
+        cc.git(clone, "add", "file")
+        self.assertEqual(self.prune()["kept_clones"][0]["reason"], "uncommitted_changes")
+        cc.git(clone, "commit", "-qm", "saved locally")
+        self.assertEqual(self.prune()["kept_clones"][0]["reason"], "unique_commits")
+        branch = "delegate/" + d.name
+        cc.git(self.repo, "fetch", str(clone), f"HEAD:refs/heads/{branch}")
+        result = self.prune()
+        self.assertEqual((result["runs"], result["clones"], result["kept_branches"]), (1, 1, [branch]))
+
     def test_unsafe_paths_and_missing_repo(self):
         outside = self.make_run()
         linked = self.make_run(clone=True)
@@ -107,14 +139,15 @@ class PruneCase(unittest.TestCase):
         cc.save_json(outside / "meta.json", meta)
         area = self.root / ".wt-delegate"
         sidecar = area / (".git-" + linked.name)
-        sidecar.rmdir()
+        sidecar.rename(self.root / "old-git")
         sidecar.symlink_to(target, target_is_directory=True)
         self.repo.rename(self.root / "moved")
         result = self.prune()
         self.assertEqual(result["unsafe_clones"], [outside.name, linked.name])
-        self.assertEqual((result["clones"], result["runs"], result["skipped"]), (1, 3, 2))
+        self.assertEqual((result["clones"], result["runs"], result["skipped"]), (0, 2, 3))
         self.assertTrue(target.is_dir() and sidecar.is_symlink() and (area / linked.name).is_dir())
-        self.assertFalse((area / normal.name).exists())
+        self.assertTrue((area / normal.name).is_dir() and normal.is_dir())
+        self.assertEqual(result["kept_clones"], [dict(task_id=normal.name, reason="inspection_failed")])
 
     def test_checked_out_branch_and_symbolic_alias_are_kept(self):
         active, aliased = (self.make_run() for _ in range(2))

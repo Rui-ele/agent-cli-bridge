@@ -960,6 +960,7 @@ class Driver:
     """Per-worker protocol. Instances are stateless, including during concurrent runs."""
     backend = None
     supports_search = False
+    executable = None
     fallback_backend = None
     unavailable_exit = None
     redispatch = None
@@ -985,7 +986,8 @@ class Driver:
         return (self.decode(raw) for raw in recent_events(path))
 
     def check_available(self):
-        pass
+        if self.executable and not shutil.which(self.executable):
+            raise WorkerLaunchError(f"{self.executable} executable not found in PATH")
 
     def prepare_files(self, cwd, run_dir, mode, repo):
         pass
@@ -1073,6 +1075,7 @@ class CodexDriver(ItemEventDriver):
 
 
 class CodexExec(CodexDriver):
+    executable = "codex"
     backend = "exec"
     supports_search = True
 
@@ -1159,6 +1162,7 @@ class CodexDaemon(CodexDriver):
 
 
 class AgyDriver(Driver):
+    executable = "agy"
     redispatch = ("codex", "exec")
 
     @property
@@ -1265,6 +1269,7 @@ class SeatbeltDriver(Driver):
     def check_available(self):
         if not seatbelt_available():
             raise Blocked("os_sandbox_unavailable")
+        super().check_available()
 
 
 class AgyAcp(SeatbeltDriver, AgyDriver, ItemEventDriver):
@@ -1287,17 +1292,13 @@ class AgyAcp(SeatbeltDriver, AgyDriver, ItemEventDriver):
 
 
 class ClaudePrint(SeatbeltDriver):
+    executable = "claude"
     backend = "print"
     relay_signals = True
     # Leave host settings, skills, hooks, tools and other delegation runs read-only.
     state_dirs = ("projects", "sessions", "session-env", "shell-snapshots", "state", "cache",
                   "file-history", "todos", "plans", "debug", "statsig", "telemetry", "backups",
                   "paste-cache", "ide")
-
-    def check_available(self):
-        super().check_available()
-        if not shutil.which("claude"):
-            raise WorkerLaunchError("claude executable not found in PATH")
 
     def window(self, model):
         return (1_000_000 if model.endswith("[1m]") else 200_000), True
@@ -1426,7 +1427,7 @@ TASK_ID = re.compile(r"\d{8}-\d{6}-(?:" + "|".join(map(re.escape, DRIVERS)) + r"
 
 def driver_for(worker, backend="exec"):
     choices = DRIVERS[worker]
-    if worker == "agy" and backend in ("exec", "daemon"):
+    if worker == "agy" and backend in ("exec", "daemon", "print"):
         return choices[None]
     if worker == "claude" and backend in (None, "exec"):
         return choices["print"]
@@ -2042,6 +2043,20 @@ def isolated_checkout(repo, cwd, gitdir, branch, base):
 PROTECTED_BRANCHES = ("main", "master")
 
 
+def is_ancestor(repo, old, new):
+    return subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", old, new],
+                          capture_output=True).returncode == 0
+
+
+def checked_out_elsewhere(repo, branch):
+    for record in git(repo, "worktree", "list", "--porcelain", "-z").split("\0\0"):
+        fields = record.split("\0")
+        if f"branch refs/heads/{branch}" in fields:
+            if Path(fields[0].removeprefix("worktree ")).resolve() != Path(repo).resolve():
+                return True
+    return False
+
+
 def land(repo, common, meta, reply, new):
     """Fast-forward the user's chosen branch to the delegate branch; nothing else moves."""
     onto, old = meta["onto"], meta["onto_before"]
@@ -2055,6 +2070,10 @@ def land(repo, common, meta, reply, new):
         skip = "onto_no_commits"
     elif git(repo, "rev-parse", f"refs/heads/{onto}").strip() != old:
         skip = "onto_branch_moved"
+    elif checked_out_elsewhere(repo, onto):
+        skip = "onto_checked_out_elsewhere"
+    elif not is_ancestor(repo, old, new):
+        skip = "onto_not_fast_forward"
     elif current == onto and git(repo, "status", "--porcelain", "--untracked-files=no"):
         skip = "checkout_has_uncommitted_changes"
     if skip:
@@ -2244,6 +2263,8 @@ def run(args, driver, quiet=False):
                     args.base = "refs/heads/" + args.onto
                     if not git(project, "rev-parse", "--verify", "-q", args.base, check=False).strip():
                         raise Blocked("unknown_onto_branch")
+                    if checked_out_elsewhere(repo, args.onto):
+                        raise Blocked("onto_checked_out_elsewhere")
                     if not args.dry_run and git(project, "status", "--porcelain", "--untracked-files=no"):
                         raise Blocked("checkout_has_uncommitted_changes")
                 if args.base:
@@ -2628,9 +2649,7 @@ def prune_branch(repo, task_id, base, dry_run, counts, kept):
     if ref not in heads:
         return
     tip, busy = heads[ref]
-    if busy or (tip != base and not any(
-            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", tip, other],
-                           capture_output=True).returncode == 0 for other in candidates)):
+    if busy or (tip != base and not any(is_ancestor(repo, tip, other) for other in candidates)):
         kept.append(branch)
         return
     if not dry_run:
@@ -2649,13 +2668,23 @@ def prune_clone(repo, task_id, worktree, dry_run, counts, unsafe):
         counts["skipped"] += 1
         return
     present = [p for p in paths if p.is_dir()]
+    if clone in present or paths[1] in present:
+        clone_git = ("--no-optional-locks", f"--git-dir={paths[1]}", f"--work-tree={clone}")
+        try:
+            if git(clone, *clone_git, "status", "--porcelain", "--untracked-files=all"):
+                return "uncommitted_changes"
+            tips = git(repo, "for-each-ref", "--format=%(objectname)", "refs/heads").splitlines()
+            if git(clone, *clone_git, "rev-list", "-1", "HEAD", "--all", "--reflog", "--not", *tips):
+                return "unique_commits"
+        except Blocked:
+            return "inspection_failed"
     if not dry_run:
         for path in present:
             shutil.rmtree(path)
     counts["clones"] += bool(present)
 
 
-def prune_run(d, cutoff, dry_run, counts, kept, unsafe):
+def prune_run(d, cutoff, dry_run, counts, kept, kept_clones, unsafe):
     with ExitStack() as stack:
         result = d / "result.json"
         metadata = d / "meta.json"
@@ -2683,9 +2712,13 @@ def prune_run(d, cutoff, dry_run, counts, kept, unsafe):
             # A finishing writer holds publish before result. Never wait in reverse order.
             if not lock(stack, common / "cc-delegate-publish.lock", create=not dry_run):
                 return False
-            prune_branch(repo, d.name, meta.get("base_sha"), dry_run, counts, kept)
         if worktree is not None:
-            prune_clone(repo, d.name, worktree, dry_run, counts, unsafe)
+            reason = prune_clone(repo, d.name, worktree, dry_run, counts, unsafe)
+            if reason:
+                kept_clones.append(dict(task_id=d.name, reason=reason))
+                return False
+        if top and Path(top) == repo:
+            prune_branch(repo, d.name, meta.get("base_sha"), dry_run, counts, kept)
         if not dry_run:
             shutil.rmtree(d)
         counts["runs"] += 1
@@ -2695,7 +2728,7 @@ def prune_run(d, cutoff, dry_run, counts, kept, unsafe):
 def prune(args):
     runs = home() / "delegate-runs"
     counts = dict(runs=0, clones=0, branches=0, skipped=0)
-    kept, unsafe, errors = [], [], []
+    kept, kept_clones, unsafe, errors = [], [], [], []
     cutoff = time.time() - args.older_than * 86400
     if runs.is_symlink():
         raise Blocked("unsafe_runs_directory")
@@ -2703,7 +2736,7 @@ def prune(args):
         if d.name == ".locks" or not d.is_dir():
             continue
         try:
-            if not prune_run(d, cutoff, args.dry_run, counts, kept, unsafe):
+            if not prune_run(d, cutoff, args.dry_run, counts, kept, kept_clones, unsafe):
                 counts["skipped"] += 1
         except (KeyError, TypeError, ValueError, OSError, Blocked, RuntimeError) as exc:
             counts["skipped"] += 1
@@ -2712,6 +2745,8 @@ def prune(args):
     for name, count in counts.items():
         print(f"{name}={count}")
     print("kept_branches=" + dumps(kept))
+    if kept_clones:
+        print("kept_clones=" + dumps(kept_clones))
     if unsafe:
         print("unsafe_clones=" + dumps(unsafe))
     if errors:
@@ -2743,13 +2778,13 @@ def main(argv=None):
     r = commands.add_parser("run")
     r.add_argument("--to", required=True, choices=tuple(DRIVERS))
     r.add_argument("--backend", choices=("exec", "daemon", "acp", "print"),
-                   help="Codex: exec or daemon. agy: exec (print) or acp. Claude: print or exec. "
+                   help="Codex: exec or daemon. agy: exec (alias: print) or acp. Claude: print or exec. "
                         "Defaults to the worker environment setting, then acp for agy writes with Seatbelt or exec.")
     r.add_argument("--model", required=True)
     task = r.add_mutually_exclusive_group(required=True)
     task.add_argument("--task")
     task.add_argument("--task-file")
-    r.add_argument("--context", choices=("none", "scoped", "session", "full"), default="session")
+    r.add_argument("--context", choices=("none", "scoped", "session", "full"), default="none")
     r.add_argument("--cc-session")
     r.add_argument("--project-dir", default=".")
     r.add_argument("--include", nargs="+", action="extend", default=[])
@@ -2761,10 +2796,15 @@ def main(argv=None):
                    help="write mode: start from BRANCH and fast-forward it to the result (not main/master)")
     r.add_argument("--base", metavar="REF_OR_TASK_ID",
                    help="write mode: start from this ref, commit or earlier task's delegate branch")
-    r.add_argument("--stall-seconds", type=positive, help="optional wall-clock backstop; default off (progress-based)")
+    r.add_argument("--stall-seconds", type=positive,
+                   help=f"seconds with all activity signals silent (agy default: {AGY_STALL_SECONDS} seconds)")
     r.add_argument("--dry-run", action="store_true")
-    r.add_argument("--no-fallback", dest="fallback", action="store_false",
-                   help="agy only: do not re-run on codex when agy stalls or fails")
+    fallback = r.add_mutually_exclusive_group()
+    fallback.add_argument("--fallback", action="store_true",
+                          help="retry agy failures on Codex (also set by CC_DELEGATE_AGY_FALLBACK=1)")
+    fallback.add_argument("--no-fallback", dest="fallback", action="store_false",
+                          help="agy only: do not re-run on codex when agy stalls or fails")
+    r.set_defaults(fallback=os.getenv("CC_DELEGATE_AGY_FALLBACK") == "1")
     r.add_argument("--fallback-model", default="gpt-6.2-astra")
     p = commands.add_parser("prune")
     p.add_argument("--older-than", type=nonnegative, default=7, metavar="DAYS")

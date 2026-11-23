@@ -52,8 +52,7 @@ class AcpCase(unittest.TestCase):
     def run_task(self, *args, model="synthetic", fallback=False, expected=0):
         argv = ["run", "--to", "agy", "--model", model, "--project-dir", str(self.project),
                 "--cc-session", str(self.session), "--task", "test ACP", *args]
-        if not fallback:
-            argv.append("--no-fallback")
+        argv.append("--fallback" if fallback else "--no-fallback")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = cc.main(argv)
@@ -258,7 +257,7 @@ class AcpCase(unittest.TestCase):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 rc = cc.main(["run", "--to", "agy", "--model", "synthetic", "--project-dir", str(self.project),
-                              "--cc-session", str(self.session), "--task", "follow up", "--resume", "old-session"])
+                              "--cc-session", str(self.session), "--task", "follow up", "--fallback", "--resume", "old-session"])
         self.assertNotEqual(rc, 0)
         self.assertIn('fallback_skipped="resume_not_portable"', out.getvalue())
         self.assertFalse((self.root / "codex-argv.json").exists())
