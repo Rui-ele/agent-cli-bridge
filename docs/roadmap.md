@@ -49,3 +49,4 @@
 - 路由规则双审（Astra 加 Neon 编排模型）发现的改派问题已修复并装回：改派会按 `CC_DELEGATE_CODEX_BACKEND` 选后端；带 `--onto` 的写入任务也能改派；带 `--resume` 的任务不再改派；只读任务改派时自动加 `--search`，并沿用模型名里的强度档位；`--context none` 也会附上 `--include` 的文件。
 - 已知遗留四条和 ACP 记账问题已修：任务期间又改了原本就有改动的文件，现在能检测到（只比文件大小和修改时间）；其他 `delegate/*` 分支被改动会报越界（并行任务的正常落地不算）；没有新提交时不再取回空分支；只读模式下给 `--base` 或 `--onto` 会直接报错；ACP 的 `total_tokens` 改为输入加输出，和 `agy -p` 一致。已装回。
 - 第 6 项：Mac mini 上装好并实测通过（Codex、agy、claude 各一次只读调用，agy 一次写入任务；沙箱照样拦住越界写入）。在那台机器上通过 SSH 使用时，macOS 钥匙串是锁着的：claude 改用 `CLAUDE_CODE_OAUTH_TOKEN` 长期令牌，agy 在 SSH 会话里登录，凭据会存进它自己的文件存储。
+- `--effort` 增加 `max` 和 `ultra`：本机 Codex 的模型缓存显示 `gpt-6.2-astra` 支持这两档，`ultra` 会自动拆子代理；Codex 不写 `--effort` 时默认是 `low`。其他接单方不支持的档位由它们自己的 CLI 拒绝。
