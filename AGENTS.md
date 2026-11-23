@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库研究本机 AI agent（Claude Code、Codex、Antigravity CLI 等）之间如何互相委托任务、拿回结果。项目背景、分层架构和路线图见 [README.md](README.md)。本文件写给在这里干活的 agent 和协作者。
+本仓库研究本机 AI agent（Claude Code、Codex、Antigravity CLI 等）之间如何互相委托任务、拿回结果。怎么用见 [README.md](README.md)，分层架构、路线图和完成记录见 [docs/roadmap.md](docs/roadmap.md)。本文件写给在这里干活的 agent 和协作者。
 
 ## 目录
 
