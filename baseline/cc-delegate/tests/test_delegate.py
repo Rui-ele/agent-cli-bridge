@@ -1117,7 +1117,8 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         out = buf.getvalue()
         self.assertEqual(code, 0, out)
         self.assertLessEqual(len(out.splitlines()), 15)
-        self.assertIn("已自动改派 Codex", out)
+        summaries = [line for line in out.splitlines() if line.startswith("summary=")]
+        self.assertIn("agy 失败（worker_failed），已自动改派 Codex", summaries[0])
         self.assertIn('fallback_reason="worker_failed"', out)
         data = json.loads((Path(json.loads(out.splitlines()[-1].split("=", 1)[1])) / "result.json").read_text())
         self.assertEqual((data["worker"], data["model"], data["status"]), ("codex", "gpt-6.2-astra", "ok"))
@@ -1125,6 +1126,23 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cc.main(["run", "--to", "agy", "--model", "m", "--cc-session", str(self.session),
                                       "--project-dir", str(self.project), "--task", "x", "--no-fallback"]), 2)
+
+    def test_missing_agy_fallback_names_original_error_first(self):
+        self.worker("codex", "sys.stdin.read()\n"
+                    "Path(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps(" + repr(ANSWER) + "))\n")
+        real_which = cc.shutil.which
+        buf = io.StringIO()
+        with patch.object(cc.shutil, "which", lambda name, *a, **k: None if name == "agy" else real_which(name, *a, **k)), \
+                contextlib.redirect_stdout(buf):
+            code = cc.main(["run", "--to", "agy", "--model", "gemini-3.8-flash-high", "--cc-session", str(self.session),
+                            "--project-dir", str(self.project), "--task", "x", "--fallback"])
+        out = buf.getvalue()
+        self.assertEqual(code, 0, out)
+        summaries = [line for line in out.splitlines() if line.startswith("summary=")]
+        self.assertIn("agy executable not found in PATH", summaries[0])
+        data = json.loads((Path(json.loads(out.splitlines()[-1].split("=", 1)[1])) / "result.json").read_text())
+        # The agy model name must not leak into the Codex retry.
+        self.assertEqual((data["worker"], data["model"]), ("codex", "gpt-6.2-astra"))
 
     def test_agy_stuck_only_after_silence(self):
         body = """
@@ -1451,3 +1469,15 @@ time.sleep(20)
         self.assertIsInstance(result["group_cleanup_confirmed"], bool)
         self.assertEqual(list(cc.records(d / "events.jsonl"))[-1]["type"], "turn.completed")
         self.assertEqual(list(cc.records(cc.home() / "delegate-log.jsonl"))[-1]["status"], "outcome_unknown")
+
+
+class PythonVersionCase(unittest.TestCase):
+    def test_old_python_gets_a_clear_message(self):
+        script = Path(cc.__file__)
+        probe = ("import runpy, sys\nsys.version_info = (3, 9, 6)\n"
+                 f"runpy.run_path({str(script)!r}, run_name='__main__')\n")
+        proc = subprocess.run([sys.executable, "-c", probe, "--help"], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("需要 Python 3.10 或更高，当前是 3.9", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(proc.stdout, "")

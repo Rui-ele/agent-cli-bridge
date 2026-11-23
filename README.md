@@ -7,12 +7,14 @@
 ## 前提
 
 - **macOS**。脚本用到 `fcntl`，原生 Windows 跑不了。`--to claude` 和 agy 的 ACP 后端靠 macOS 自带的 `/usr/bin/sandbox-exec` 限制写入，Linux 上会以 `os_sandbox_unavailable` 拒绝；Linux 上只能用 `--to codex` 和 `--to agy --backend exec`。
-- **Python 3.10 或更高**。macOS 自带的 `/usr/bin/python3` 可能是 3.9，跑不了；可以用 Homebrew 装：`brew install python`。
+- **Python 3.10 或更高**。macOS 自带的 `/usr/bin/python3` 是 3.9，跑不了（脚本会提示版本不够并退出）。没有开发工具的 Mac，最简单的是从 [python.org](https://www.python.org/downloads/macos/) 下载安装包；装过 Homebrew 的可以 `brew install python`。装完新开一个终端，`python3 --version` 应显示 3.10 或更高。
 - **git**。写入任务要求项目是 git 仓库。
 - **至少一个接单方的 CLI，已装好并登录**：
-  - Codex：`codex`；
-  - agy：`agy`；
-  - Claude Code：`claude`。
+  - Codex：`codex`，安装见 [Codex CLI 文档](https://developers.openai.com/codex/cli)；
+  - agy：`agy`，安装见 [Antigravity CLI 安装说明](https://antigravity.google/docs/cli/install)；
+  - Claude Code：`claude`，安装见 [Claude Code 安装说明](https://code.claude.com/docs/en/setup)。Claude 桌面版自带的 `claude` 不在 PATH 上，终端里找不到，要另外装一次 Claude Code CLI。
+
+  装好后在新终端里运行 `codex --version`、`agy --version` 或 `claude --version` 确认能找到。找不到时，脚本会在开始前报 `… executable not found in PATH`。
 
   通过 SSH 在另一台 Mac 上使用时，macOS 钥匙串是锁着的，存在钥匙串里的登录读不到：claude 可以用 `claude setup-token` 生成长期令牌，放进环境变量 `CLAUDE_CODE_OAUTH_TOKEN`；agy 在 SSH 会话里登录一次即可。
 - **模型名**要填你的账号在该 CLI 里能用的。下文示例用的是作者的模型，可以用各 CLI 列模型的命令（如 `agy models`）查看。

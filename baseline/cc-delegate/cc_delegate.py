@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 """Delegate a Claude Code task to a local agent CLI (Python 3.10+)."""
+import sys
+
+# macOS ships Python 3.9, which dies below on `X | None` annotations with a TypeError that
+# does not say "upgrade Python". Check before any of that runs; this block must stay 3.0-safe.
+if sys.version_info < (3, 10):
+    sys.exit("cc_delegate.py 需要 Python 3.10 或更高，当前是 %d.%d（%s）。"
+             "请先装新版 Python，见 README 的「前提」一节。" % (sys.version_info[0], sys.version_info[1], sys.executable))
+
 import argparse
 import asyncio
 import base64
@@ -22,7 +30,6 @@ import signal
 import stat
 import struct
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -2131,7 +2138,12 @@ def receipt(data):
     row("task_id", "status")
     row("worker_session_id", "model", *(k for k in ("backend", "resume_command") if k in data), limit=320)
     row("duration_s", "worker_usage", limit=320)
-    for item in data.get("summary", []):
+    summary = data.get("summary", [])
+    if data.get("fallback_from"):
+        # Say why the original worker failed before the retry's own summary, or a failed
+        # retry reads as if it were the original error.
+        summary = [f"agy 失败（{data.get('fallback_reason')}），已自动改派 Codex，以下是 Codex 的结果"] + summary
+    for item in summary:
         print(field("summary", item, 320))
     flags = ["uncertainties"]
     if data.get("group_cleanup_confirmed") is False:
@@ -2145,8 +2157,7 @@ def receipt(data):
     if data.get("fallback_skipped"):
         flags.append("fallback_skipped")
     if data.get("fallback_from"):
-        data = dict(data, fallback="agy 失败，已自动改派 Codex")
-        flags += ["fallback", "fallback_from", "fallback_reason"]
+        flags += ["fallback_from", "fallback_reason"]
     row(*flags, limit=320)
     if data.get("mode") == "write":
         extra = [field("onto", data["onto"]), field("rollback", data.get("rollback"))] if data.get("onto") else []
