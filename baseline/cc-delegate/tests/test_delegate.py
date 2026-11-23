@@ -1,5 +1,6 @@
 """Synthetic transcripts and offline CLI doubles. Every writable path is under the checkout."""
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import hashlib
 import io
@@ -32,6 +33,7 @@ class FakeDaemon:
         self.error = None
         self.client = None
         self.proc = None
+        self.interrupted = threading.Event()
 
     @contextlib.contextmanager
     def serving(self):
@@ -73,7 +75,7 @@ class FakeDaemon:
                     self.client.close()
                 return self.proc
 
-            def serve():
+            def serve(accept):
                 try:
                     with accept() as sock, sock.makefile("rb") as stream:
                         sock.settimeout(12)
@@ -81,9 +83,20 @@ class FakeDaemon:
                 except Exception as exc:
                     self.error = exc
 
-            thread = threading.Thread(target=serve, daemon=True)
+            thread = threading.Thread(target=serve, args=(accept,), daemon=True)
             thread.start()
+
+            async def connect_control(path):
+                self.case.assertEqual(Path(path), self.path)
+                peer, client = socket.socketpair()
+                handler = threading.Thread(target=serve, args=(lambda: peer,), daemon=True)
+                handler.start()
+                stack.callback(handler.join, 12)
+                return await cc.asyncio.open_connection(sock=client)
+
             with patch.object(subprocess, "Popen", launch):
+                if self.outcome == "controlled":
+                    stack.enter_context(patch.object(cc.asyncio, "open_unix_connection", connect_control))
                 try:
                     yield self
                 finally:
@@ -126,9 +139,13 @@ class FakeDaemon:
             self.case.assertEqual(opcode, 129)
             return json.loads(raw)
 
+        method = None
+
         def call(*methods):
+            nonlocal method
             msg = receive()
-            self.case.assertIn(msg["method"], methods)
+            method = msg["method"]
+            self.case.assertIn(method, methods)
             self.case.assertEqual(msg["jsonrpc"], "2.0")
             self.calls[msg["method"]] = msg.get("params")
             return msg.get("id")
@@ -143,7 +160,20 @@ class FakeDaemon:
         frame(raw[6:], 128)
         self.case.assertEqual(read_frame(), (138, b"alive"))
         call("initialized")
-        rid = call("thread/start", "thread/resume")
+        rid = call("thread/start", "thread/resume", "turn/steer", "turn/interrupt", "thread/read")
+        if method in ("turn/steer", "turn/interrupt", "thread/read"):
+            if method == "thread/read":
+                result = {"thread": {"turns": [{"id": "u1", "status": "inProgress", "items": [{"id": "cmd"}]},
+                                               {"id": "older", "status": "completed", "items": []}]}}
+            elif method == "turn/steer" and self.calls[method]["input"][0]["text"] == "reject":
+                send({"id": rid, "error": {"code": -42, "message": "fixture steer rejected"}})
+                return
+            else:
+                result = {"turnId": "u1"} if method == "turn/steer" else {}
+            send({"id": rid, "result": result})
+            if method == "turn/interrupt":
+                self.interrupted.set()
+            return
         send({"id": rid, "result": {"thread": {"id": "t1"}}})
         rid = call("thread/name/set")
         if "thread/resume" in self.calls:
@@ -161,7 +191,13 @@ class FakeDaemon:
         send({"id": 1, "method": "item/commandExecution/requestApproval", "params": {}})
         refused = receive()
         self.case.assertEqual((refused["id"], refused["error"]["code"]), (1, -32601))
-        if self.outcome in ("interrupt", "ignore_interrupt"):
+        if self.outcome == "controlled":
+            notify("item/completed", turnId="u1", item={"type": "commandExecution", "id": "cmd",
+                                                        "command": "pwd", "exitCode": 7})
+            notify("item/completed", turnId="u1", item={"type": "agentMessage", "id": "msg", "text": "中" * 210})
+            self.case.assertTrue(self.interrupted.wait(10))
+            turn["status"] = "interrupted"
+        elif self.outcome in ("interrupt", "ignore_interrupt"):
             self.proc.send_signal(signal.SIGTERM if self.outcome == "interrupt" else signal.SIGINT)
             rid = call("turn/interrupt")
             if self.outcome == "ignore_interrupt":
@@ -321,6 +357,164 @@ class DelegateCase(unittest.TestCase):
             self.assertNotIn("backend", data)
             self.assertEqual(cc.shlex.split((d / "command.txt").read_text())[0], "agy")
 
+    def control(self, *args, expected=0):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cc.main(list(args)), expected, err.getvalue())
+        return err.getvalue() if expected else out.getvalue()
+
+    def wait_for_event(self, value):
+        deadline = time.monotonic() + 6
+        runs = cc.home() / "delegate-runs"
+        while time.monotonic() < deadline:
+            for path in runs.glob("*/events.jsonl"):
+                if value in path.read_text():
+                    return path.parent
+            time.sleep(.02)
+        self.fail(f"missing worker event {value}")
+
+    def test_control_live_daemon(self):
+        message = "补" * 200 + "完整消息结尾"
+
+        def control_turn():
+            d = self.wait_for_event("agent_message")
+            meta = json.loads((d / "meta.json").read_text())
+            state = json.loads((d / "daemon.json").read_text())
+            self.assertEqual(state, dict(socket=str(server.path), thread_id="t1", turn_id="u1",
+                                         worker_pid=meta["worker_pgid"]))
+            status = self.control("status", d.name)
+            self.assertLessEqual(len(status.splitlines()), 15)
+            for field in ('backend="daemon"', 'mode="ro"', 'elapsed_s=', 'command="pwd" exit_code=7',
+                          'turn_status="inProgress" item_count=1', 'agent_message="' + "中" * 200 + '"'):
+                self.assertIn(field, status)
+            self.assertEqual(server.calls["thread/read"], {"threadId": "t1", "includeTurns": True})
+            self.assertIn("fixture steer rejected", self.control("steer", d.name, "--message", "reject", expected=1))
+            self.assertEqual(len(self.control("steer", d.name, "--message", message).splitlines()), 1)
+            self.assertEqual(server.calls["turn/steer"], dict(threadId="t1", expectedTurnId="u1",
+                             input=[dict(type="text", text=message, text_elements=[])]))
+            self.assertEqual(cc.main(["cancel", d.name]), 0)
+            return d
+
+        with FakeDaemon(self, "controlled").serving() as server, ThreadPoolExecutor(1) as pool, \
+                contextlib.redirect_stdout(io.StringIO()), patch.object(cc, "TERM_GRACE", .05):
+            control = pool.submit(control_turn)
+            rc = cc.main(["run", "--to", "codex", "--model", "synthetic", "--cc-session", str(self.session),
+                          "--project-dir", str(self.project), "--task", "验收", "--backend", "daemon"])
+            d = control.result()
+        data = json.loads((d / "result.json").read_text())
+        self.assertEqual((rc, data["status"], data["reason"]), (2, "cancelled", "cancelled_by_user"))
+        self.assertEqual(server.calls["turn/interrupt"], dict(threadId="t1", turnId="u1"))
+        self.assertEqual(json.loads((d / "daemon.json").read_text())["turn_status"], "interrupted")
+        log = list(cc.records(d / "control.jsonl"))
+        self.assertEqual([(r["action"], r["result"]) for r in log],
+                         [("steer", "error"), ("steer", "ok"), ("cancel", "requested"), ("interrupt", "ok")])
+        self.assertEqual(log[1]["message"], message[:200])
+        self.assertTrue(all(r["ts"] for r in log))
+        self.control("mark", d.name, "--outcome", "discarded")
+        self.assertIn('status="cancelled"', self.control("cancel", d.name))
+        self.assertEqual(json.loads((d / "result.json").read_text())["outcome"], "discarded")
+
+    def test_steer_blocked_and_offline_status(self):
+        d = cc.home() / "delegate-runs/20261123-120000-codex-abcd"
+        d.mkdir(parents=True)
+        meta = dict(backend="exec", mode="ro", started_at=cc.now())
+        cc.save_json(d / "meta.json", meta)
+
+        def check(reason):
+            self.assertEqual(self.control("steer", d.name, "--message", "test", expected=1).strip(), reason)
+
+        check("steer_requires_daemon_backend")
+        cc.save_json(d / "meta.json", dict(meta, backend="daemon"))
+        check("turn_not_started")
+        cc.save_json(d / "daemon.json", dict(socket=str(self.root / "missing"), thread_id="t1", turn_id="u1"))
+        (d / "events.jsonl").write_text('{"item":{"type":"command_execution","command":"ls","exit_code":1}}\n{')
+        status = self.control("status", d.name)
+        self.assertIn('command="ls" exit_code=1', status)
+        self.assertIn("daemon_unavailable=", status)
+        cc.save_json(d / "result.json", meta)
+        check("task_finished")
+
+    def test_cancel_exec_signals_worker(self):
+        self.check_cancel_exec(writing=False)
+
+    def test_cancel_write_keeps_commit_off_onto(self):
+        self.check_cancel_exec(writing=True)
+
+    def check_cancel_exec(self, writing):
+        args = []
+        setup = ""
+        if writing:
+            self.commit_fixture()
+            cc.git(self.project, "branch", "feature")
+            args += ["--mode", "write", "--onto", "feature"]
+            setup = """import subprocess, signal
+Path("a").write_text("partial work")
+subprocess.run(["git","-c","user.name=W","-c","user.email=w@x.invalid","commit","-qam","partial"], check=True)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) + "))\n"
+        table = self.root / "process-table"
+        self.worker("codex", setup + f"Path({str(table)!r}).write_text(f'{{os.getpid()}} {{os.getpgrp()}} ' + ' '.join(sys.argv))\n"
+                    "print(json.dumps({'type':'item.completed','item':{'type':'command_execution',"
+                    "'command':'fixture_ready','exit_code':0}}), flush=True)\ntime.sleep(20)")
+        try:
+            subprocess.run(["ps", "-p", str(os.getpid()), "-o", "pid="], check=True, capture_output=True)
+        except (OSError, subprocess.CalledProcessError):
+            # In a restricted sandbox the worker supplies its own PID, PGID and argv.
+            self.worker("ps", f"assert sys.argv[1:] == ['-axww', '-o', 'pid=,pgid=,command=']\n"
+                        f"print(Path({str(table)!r}).read_text())")
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--to", "codex", "--model", "synthetic",
+                                 "--cc-session", str(self.session), "--project-dir", str(self.project),
+                                 "--task", "验收", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            d = self.wait_for_event("fixture_ready")
+            self.assertIn('command="fixture_ready" exit_code=0', self.control("status", d.name))
+            self.control("cancel", d.name, "--wait", "0")
+            stdout, stderr = proc.communicate(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 2, stderr)
+        data = json.loads((d / "result.json").read_text())
+        self.assertIn('status="cancelled"', stdout)
+        self.assertEqual(data["reason"], "cancelled_by_user")
+        self.assertEqual(data["exit_code"], 0 if writing else -signal.SIGTERM)
+        self.assertEqual(data["worker_pid"], data["worker_pgid"])
+        actions = [(r["action"], r["result"]) for r in cc.records(d / "control.jsonl")]
+        self.assertEqual(actions, [("cancel", "requested"), ("SIGTERM", "sent")])
+        if writing:
+            self.assertEqual(cc.git(self.project, "rev-parse", "feature").strip(), data["base_sha"])
+            self.assertEqual(cc.git(self.project, "show", f"delegate/{d.name}:a"), "partial work")
+            self.assertIn("onto_skipped_unsuccessful", data["uncertainties"])
+
+    def test_cancel_requires_matching_process_group(self):
+        d = cc.home() / "delegate-runs/20261123-120000-codex-abcd"
+        d.mkdir(parents=True)
+        cc.save_json(d / "meta.json", dict(backend="exec", worker_pgid=43210))
+        self.worker("ps", f"print('43210 43210 unrelated\\n54321 54321 codex {d}/last.txt')")
+        with patch.object(os, "killpg") as kill:
+            error = self.control("cancel", d.name, "--wait", "0", expected=1)
+        self.assertEqual(error.strip(), "worker_not_found")
+        kill.assert_not_called()
+        self.assertTrue((d / "cancel.requested").exists())
+        self.assertEqual(list(cc.records(d / "control.jsonl"))[-1]["result"], "worker_not_found")
+
+    def test_cancel_rechecks_group_before_kill(self):
+        d = cc.home() / "delegate-runs/20261123-120000-codex-abcd"
+        d.mkdir(parents=True)
+        cc.save_json(d / "meta.json", dict(backend="daemon", worker_pgid=43210))
+        cc.save_json(d / "daemon.json", dict(socket=str(self.root / "missing"), thread_id="t1", turn_id="u1"))
+        match = {43211: f"worker -o {d}/last.txt"}
+        for after_term, expected in ((match, 0), ({43210: "another task"}, 1)):
+            with self.subTest(expected=expected), patch.object(cc, "wait_result", return_value=False) as wait, \
+                    patch.object(cc, "group_commands", side_effect=[match, after_term]), patch.object(os, "killpg") as kill:
+                self.control("cancel", d.name, "--wait", "0", expected=expected)
+                self.assertEqual([call.args[1] for call in wait.call_args_list], [0, 5])
+                signals = [signal.SIGTERM] if expected else [signal.SIGTERM, signal.SIGKILL]
+                self.assertEqual([call.args for call in kill.call_args_list], [(43210, sig) for sig in signals])
+                self.assertTrue(any(r["action"] == "interrupt" and r["result"] == "error"
+                                    for r in cc.records(d / "control.jsonl")))
+
     def test_transcript_and_tiers(self):
         rows = []
         for i in range(5):
@@ -456,6 +650,8 @@ class DelegateCase(unittest.TestCase):
                     f'"status":"SUCCESS","structured_output":{ANSWER!r}}}}}))\n')
         d, data = self.run_task(worker="agy")
         self.assertEqual(data["status"], "ok")
+        self.assertGreater(data["worker_pid"], 0)
+        self.assertEqual(data["worker_pid"], data["worker_pgid"])
         self.assertEqual(data["worker_session_id"], "c1")
         self.assertEqual(data["worker_usage"]["total_tokens"], 9)
         self.assertEqual((d / "report.md").read_text(), "# report")

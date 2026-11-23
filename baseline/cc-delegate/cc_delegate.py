@@ -449,6 +449,19 @@ class DaemonConnection:
         self.reader, self.writer = reader, writer
         self.request_id = 0
         self.upgraded = False
+        self.log_events = True
+
+    @classmethod
+    async def connect(cls, path, log_events=True):
+        reader, writer = await asyncio.open_unix_connection(path)
+        conn = cls(reader, writer)
+        conn.log_events = log_events
+        try:
+            await conn.initialize()
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
     async def initialize(self):
         key = base64.b64encode(os.urandom(16)).decode()
@@ -521,13 +534,14 @@ class DaemonConnection:
         while True:
             msg = await self.receive()
             if msg.get("id") == "name" and "method" not in msg:
-                if "error" in msg:
+                if "error" in msg and self.log_events:
                     daemon_event("thread.name_failed", error=msg["error"])
                 continue
             if "id" not in msg or "method" not in msg:
                 return msg
             self.send({"id": msg["id"], "error": {"code": -32601, "message": "unsupported server request"}})
-            daemon_event("server_request.rejected", method=msg["method"], id=msg["id"])
+            if self.log_events:
+                daemon_event("server_request.rejected", method=msg["method"], id=msg["id"])
 
     async def request(self, method, params, notifications=None):
         self.request_id += 1
@@ -537,7 +551,7 @@ class DaemonConnection:
             msg = await self.message()
             if msg.get("id") == rid:
                 if "error" in msg:
-                    raise ValueError(f"{method}: {msg['error']}")
+                    raise ValueError(f"{method}: {dumps(msg['error'])}")
                 if not isinstance(msg.get("result"), dict):
                     raise ValueError(f"{method}: missing result object")
                 return msg["result"]
@@ -553,8 +567,10 @@ class DaemonConnection:
 
 
 class DaemonTurn:
-    def __init__(self, conn):
+    def __init__(self, conn, state_path, socket_path):
         self.conn = conn
+        self.state_path = state_path
+        self.state = dict(socket=str(Path(socket_path).resolve()), worker_pid=os.getpid())
         self.thread = self.turn = None
         self.submitted = self.stopping = False
         self.last = self.usage = None
@@ -587,6 +603,7 @@ class DaemonTurn:
             counts = params["tokenUsage"]["total"]
             self.usage = {re.sub(r"(?=[A-Z])", "_", k).lower(): v for k, v in counts.items()}
         elif method == "turn/completed":
+            save_json(self.state_path, dict(self.state, turn_status=turn["status"]))
             if turn["status"] == "completed":
                 daemon_event("turn.completed", usage=self.usage)
                 return 0
@@ -621,6 +638,8 @@ class DaemonTurn:
         self.submitted = True
         result = await self.conn.request("turn/start", dict(start, threadId=self.thread), early)
         self.turn = result["turn"]["id"]
+        self.state.update(thread_id=self.thread, turn_id=self.turn)
+        save_json(self.state_path, self.state)
         if self.stopping:
             self.interrupt()
         for msg in early:
@@ -638,13 +657,11 @@ async def daemon_worker(args):
     conn = turn = None
     try:
         try:
-            reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(args.socket), 5)
-            conn = DaemonConnection(reader, writer)
-            await asyncio.wait_for(conn.initialize(), 5)
+            conn = await asyncio.wait_for(DaemonConnection.connect(args.socket), 5)
         except (OSError, EOFError, ValueError, KeyError, asyncio.TimeoutError, asyncio.LimitOverrunError) as exc:
             daemon_event("turn.failed", error=str(exc) or type(exc).__name__)
             return DAEMON_UNAVAILABLE
-        turn = DaemonTurn(conn)
+        turn = DaemonTurn(conn, Path(args.o).parent / "daemon.json", args.socket)
         task = asyncio.create_task(turn.run(args, prompt))
         loop = asyncio.get_running_loop()
 
@@ -1034,6 +1051,11 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
         net = start_net_monitor(proc.pid)
         meta["liveness"] = "output+files+network" if net else "output+files"
         try:
+            # start_new_session makes the child's PID its process group ID.
+            meta.update(worker_pid=proc.pid, worker_pgid=proc.pid)
+            save_json(run_dir / "meta.json", meta)
+            if (run_dir / "cancel.requested").exists():
+                raise Blocked("cancelled_by_user")
             with selectors.DefaultSelector() as sel:
                 for pipe, event, name in [(proc.stdin, selectors.EVENT_WRITE, "stdin"),
                                           (proc.stdout, selectors.EVENT_READ, "stdout"),
@@ -1121,7 +1143,10 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
                         break
             if stalled or events.error or peek_exit(proc.pid):
                 finish()
-                meta["group_cleanup_confirmed"] = stop_group(proc)
+                # A waitable leader can keep an empty group visible through the whole TERM grace.
+                alone = ((run_dir / "cancel.requested").exists() and peek_exit(proc.pid) is not None
+                         and set(group_commands(proc.pid)) == {proc.pid})
+                meta["group_cleanup_confirmed"] = alone or stop_group(proc)
             return proc.wait(), stalled
         except BaseException:
             finish()
@@ -1348,7 +1373,7 @@ def append_log(data, event):
 
 
 def exit_status(status):
-    return {"ok": 0, "partial": 0, "dry_run": 0, "outcome_unknown": 2, "stalled": 2}.get(status, 1)
+    return {"ok": 0, "partial": 0, "dry_run": 0, "outcome_unknown": 2, "stalled": 2, "cancelled": 2}.get(status, 1)
 
 
 def receipt(data):
@@ -1507,7 +1532,7 @@ def run(args, quiet=False):
                 with (run_interrupts() if daemon else nullcontext(finish)) as finish_attempt:
                     rc, stalled = supervise(cmd, cwd, d, prompt, meta, stall, events, finish_attempt, env)
                 if daemon:
-                    if rc == DAEMON_UNAVAILABLE and not stalled:
+                    if rc == DAEMON_UNAVAILABLE and not stalled and not (d / "cancel.requested").exists():
                         args.backend = "exec"
                         meta.update(backend="exec", backend_fallback="daemon_unavailable",
                                     backend_fallback_reason=events.error, exit_code=None)
@@ -1561,38 +1586,48 @@ def run(args, quiet=False):
         finish()
         if meta.get("group_cleanup_confirmed") is False:
             reply["uncertainties"].append("group_cleanup_unconfirmed")
-        if worktree:
-            try:
-                with ExitStack() as publish:
+        with ExitStack() as publish:
+            publish_error = None
+            if worktree:
+                try:
                     # Sibling write tasks fetch and land into the same repository; one at a time.
                     lock(publish, common / "cc-delegate-publish.lock", blocking=True)
                     after = checkout_state(Path(repo))
                     breach = breaches(before, after, landings_since(common, watch_from))
                     if breach:
-                        # The user may also have edited the checkout meanwhile; flag it either way.
                         meta["isolation_breach"] = breach
                         reply["uncertainties"].append("isolation_breach:" + ",".join(breach))
                         if meta["status"] == "ok":
                             meta["status"] = "partial"
-                    # Publish the private branch into the user's repository for review.
                     # Take whatever the worker left checked out, even if it switched branches.
                     git(Path(repo), *UNTRUSTED, "fetch", "-q", "--no-tags", str(worktree),
                         f"+HEAD:refs/heads/delegate/{task_id}")
                     meta["changed_files"], meta["diff_stat"] = diff_info(worktree, meta["base_sha"])
-                    if meta.get("onto"):
-                        land(Path(repo), common, meta, reply)
-            except (OSError, Blocked) as error:
-                meta["status"] = "outcome_unknown"
+                except (OSError, Blocked) as error:
+                    publish_error = error
+            # Accept cancellation during fetch, then serialize the landing decision with result publication.
+            lock(stack, d / ".result.lock", blocking=True)
+            cancelled = (d / "cancel.requested").exists()
+            if cancelled:
+                meta.update(status="cancelled", reason="cancelled_by_user")
+                reply["summary"] = ["cancelled_by_user"]
+                reply["uncertainties"] = [u for u in reply["uncertainties"] if u != "worker_failed"]
+            if worktree and meta.get("onto") and publish_error is None:
+                try:
+                    land(Path(repo), common, meta, reply)
+                except (OSError, Blocked) as error:
+                    publish_error = error
+            if publish_error is not None:
+                if not cancelled:
+                    meta["status"] = "outcome_unknown"
                 meta.setdefault("reason", "diff_collection_failed")
-                reply["uncertainties"].extend(["diff_collection_failed", str(error)])
+                reply["uncertainties"].extend(["diff_collection_failed", str(publish_error)])
         meta.update(duration_s=round(time.monotonic()-start, 3), finished_at=now())
         save_text(d / "report.md", reply["report_markdown"])
         meta.update(summary=reply["summary"], uncertainties=reply["uncertainties"])
         save_json(d / "meta.json", meta)
-        with ExitStack() as publish:
-            lock(publish, d / ".result.lock", blocking=True)
-            save_json(d / "result.json", meta)
-            append_log(meta, "run")
+        save_json(d / "result.json", meta)
+        append_log(meta, "run")
     args.result = meta
     if not quiet:
         receipt(meta)
@@ -1615,19 +1650,219 @@ def run_with_fallback(args):
     return run(retry)
 
 
+def daemon_state(d):
+    try:
+        return json.loads((d / "daemon.json").read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def daemon_request(state, method, **params):
+    async def request():
+        conn = await DaemonConnection.connect(state["socket"], log_events=False)
+        try:
+            return await conn.request(method, dict(threadId=state["thread_id"], **params))
+        finally:
+            conn.close()
+
+    try:
+        return asyncio.run(asyncio.wait_for(request(), 2))
+    except (OSError, EOFError, ValueError, KeyError, asyncio.TimeoutError, asyncio.LimitOverrunError) as exc:
+        raise Blocked(str(exc) or type(exc).__name__) from exc
+
+
+def control_log(d, action, result, **fields):
+    with (d / "control.jsonl").open("a", encoding="utf-8") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(dumps(dict(ts=now(), action=action, result=result, **fields)) + "\n")
+
+
+def steer(d, meta, message):
+    preview = dict(message=redact(message[:200])[0][:200])
+    if (d / "result.json").is_file():
+        reason = "task_finished"
+    elif meta.get("backend") != "daemon":
+        reason = "steer_requires_daemon_backend"
+    else:
+        state = daemon_state(d)
+        reason = None if state.get("turn_id") else "turn_not_started"
+    if reason:
+        control_log(d, "steer", reason, **preview)
+        raise Blocked(reason)
+    try:
+        daemon_request(state, "turn/steer", expectedTurnId=state["turn_id"],
+                       input=[{"type": "text", "text": message, "text_elements": []}])
+    except Blocked:
+        control_log(d, "steer", "error", **preview)
+        raise
+    control_log(d, "steer", "ok", **preview)
+    print(f"{d.name} steer ok")
+
+
+def wait_result(path, seconds):
+    deadline = time.monotonic() + seconds
+    while not path.is_file():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        time.sleep(min(.1, left))
+    return True
+
+
+def group_commands(pgid):
+    if not isinstance(pgid, int) or pgid <= 1 or pgid == os.getpgrp():
+        return {}
+    try:
+        processes = subprocess.run(["ps", "-axww", "-o", "pid=,pgid=,command="], capture_output=True,
+                                   text=True, errors="replace", timeout=2, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    group = {}
+    for row in processes.stdout.splitlines():
+        fields = row.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1] == str(pgid):
+            group[int(fields[0])] = fields[2] if len(fields) == 3 else ""
+    return group
+
+
+def cancel(d, seconds):
+    result = d / "result.json"
+    with ExitStack() as stack:
+        lock(stack, d / ".result.lock", blocking=True)
+        if result.is_file():
+            control_log(d, "cancel", "task_finished")
+            receipt(json.loads(result.read_text()))
+            return
+        (d / "cancel.requested").touch()
+        control_log(d, "cancel", "requested")
+        meta = json.loads((d / "meta.json").read_text())
+    if meta.get("backend") == "daemon":
+        state = daemon_state(d)
+        if state.get("turn_id"):
+            try:
+                daemon_request(state, "turn/interrupt", turnId=state["turn_id"])
+                control_log(d, "interrupt", "ok")
+            except Blocked as exc:
+                control_log(d, "interrupt", "error", error=redact(str(exc))[0][:200])
+        else:
+            control_log(d, "interrupt", "turn_not_started")
+    for sig, delay in ((signal.SIGTERM, seconds), (signal.SIGKILL, 5)):
+        if wait_result(result, delay):
+            break
+        with ExitStack() as stack:
+            lock(stack, d / ".result.lock", blocking=True)
+            if result.is_file():
+                break
+            pgid = json.loads((d / "meta.json").read_text()).get("worker_pgid")
+            if not any(str(d) in cmd for cmd in group_commands(pgid).values()):
+                control_log(d, sig.name, "worker_not_found")
+                raise Blocked("worker_not_found")
+            try:
+                os.killpg(pgid, sig)
+            except ProcessLookupError as exc:
+                control_log(d, sig.name, "worker_not_found")
+                raise Blocked("worker_not_found") from exc
+            except OSError as exc:
+                control_log(d, sig.name, "error", error=str(exc))
+                raise
+            control_log(d, sig.name, "sent")
+    if result.is_file():
+        receipt(json.loads(result.read_text()))
+    else:
+        print(f"{d.name} SIGKILL sent")
+
+
+def recent_events(path):
+    # Search from the tail so normal status calls need only the latest events.
+    try:
+        f = path.open("rb")
+    except FileNotFoundError:
+        return
+    with f:
+        pos = f.seek(0, os.SEEK_END)
+        fragments = []
+        while pos:
+            size = min(pos, 65536)
+            pos -= size
+            f.seek(pos)
+            lines = f.read(size).split(b"\n")
+            if pos and len(lines) == 1:
+                fragments.append(lines[0])
+                continue
+            lines[-1] += b"".join(reversed(fragments))
+            fragments = [lines.pop(0)] if pos else []
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if isinstance(event, dict):
+                    yield event
+
+
+def running_status(d, meta):
+    elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(meta["started_at"])
+    backend = meta.get("backend", "agy" if meta.get("worker") == "agy" else "exec")
+    print(f'task_id={d.name} status="running" elapsed_s={max(0, int(elapsed.total_seconds()))}'
+          f' backend={dumps(backend)} mode={dumps(meta["mode"])}')
+    command = message = code = None
+    for event in recent_events(d / "events.jsonl"):
+        item = event.get("item")
+        if isinstance(item, dict):
+            if command is None and item.get("type") == "command_execution":
+                command, code = item.get("command"), item.get("exit_code")
+            if message is None and item.get("type") == "agent_message":
+                message = item.get("text")
+        step = event.get("step_update")
+        if isinstance(step, dict):
+            info = step.get("tool_info") or {}
+            if command is None and step.get("tool_name") == "run_command" and isinstance(info, dict):
+                params = info.get("parameters")
+                if isinstance(params, dict):
+                    command, code = params.get("CommandLine"), info.get("exit_code")
+            if message is None and step.get("step_type") == "message":
+                message = step.get("text")
+        if command is not None and message is not None:
+            break
+
+    def preview(value, limit):
+        if value is None:
+            return "null"
+        return dumps(" ".join(redact(str(value)[:limit])[0][:limit].splitlines()))
+
+    print(f"command={preview(command, None)} exit_code={dumps(code if isinstance(code, int) else None)}")
+    print(f"agent_message={preview(message, 200)}")
+    if backend == "daemon":
+        try:
+            state = daemon_state(d)
+            if not state.get("turn_id"):
+                raise Blocked("turn_not_started")
+            response = daemon_request(state, "thread/read", includeTurns=True)
+            turn = next((t for t in response["thread"]["turns"] if t["id"] == state["turn_id"]), None)
+            if turn is None:
+                raise Blocked("turn_not_found")
+            print(f'turn_status={preview(turn["status"], 50)} item_count={len(turn["items"])}')
+        except (Blocked, KeyError, TypeError) as exc:
+            print(f"daemon_unavailable={preview(exc, 200)}")
+
+
 def existing(args):
     if not TASK_ID.fullmatch(args.task_id):
         raise Blocked("invalid_task_id")
     d = home() / "delegate-runs" / args.task_id
     if not d.is_dir():
         raise Blocked("unknown_task_id")
+    if args.command == "cancel":
+        cancel(d, args.wait)
+        return 0
     with ExitStack() as stack:
         if args.command == "mark":
             lock(stack, d / ".result.lock", blocking=True)
         result = d / "result.json"
         if args.command == "mark" and not result.is_file():
             raise Blocked("task_still_running")
-        data = json.loads((result if result.is_file() else d / "meta.json").read_text())
+        finished = result.is_file()
+        data = json.loads((result if finished else d / "meta.json").read_text())
         if args.command == "mark":
             data["context"] = data.get("effective_context", data.get("context"))
             selector = args.cc_session or data["cc_session"]
@@ -1640,8 +1875,12 @@ def existing(args):
             save_json(result, data)
             append_log(data, "mark")
             print(f"{args.task_id} {args.outcome}")
-        else:
+        elif args.command == "steer":
+            steer(d, data, args.message)
+        elif finished:
             receipt(data)
+        else:
+            running_status(d, data)
     return 0
 
 
@@ -1650,6 +1889,12 @@ def positive(value):
     if not math.isfinite(n) or n <= 0:
         raise argparse.ArgumentTypeError("must be positive and finite")
     return n
+
+
+def wait_seconds(value):
+    if float(value) == 0:
+        return 0
+    return positive(value)
 
 
 def main(argv=None):
@@ -1684,6 +1929,12 @@ def main(argv=None):
                    help="agy only: do not re-run on codex when agy stalls or fails")
     r.add_argument("--fallback-model", default="gpt-6.2-astra")
     commands.add_parser("status").add_argument("task_id")
+    s = commands.add_parser("steer")
+    s.add_argument("task_id")
+    s.add_argument("--message", required=True)
+    c = commands.add_parser("cancel")
+    c.add_argument("task_id")
+    c.add_argument("--wait", type=wait_seconds, default=15, metavar="SECONDS")
     m = commands.add_parser("mark")
     m.add_argument("task_id")
     m.add_argument("--outcome", choices=("accepted", "edited", "discarded"), required=True)
@@ -1698,7 +1949,7 @@ def main(argv=None):
     try:
         return run_with_fallback(args) if args.command == "run" else existing(args)
     except (OSError, ValueError, Blocked) as error:
-        print(redact(str(error))[0], file=sys.stderr)
+        print(str(error) if args.command == "steer" else redact(str(error))[0], file=sys.stderr)
         return 1
 
 
