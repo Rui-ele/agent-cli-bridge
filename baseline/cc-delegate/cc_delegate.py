@@ -2346,6 +2346,15 @@ def run(args, driver, quiet=False):
     return exit_status(meta["status"])
 
 
+def resolve_backend(to, mode, explicit):
+    if explicit:
+        return explicit, "cli"
+    configured = os.getenv(f"CC_DELEGATE_{to.upper()}_BACKEND")
+    if configured is not None:
+        return configured, "env"
+    return ("acp" if to == "agy" and mode == "write" else "exec"), "auto"
+
+
 def run_with_fallback(args, driver):
     """Redispatch is a new, separately accounted task, with its own checkout and session."""
     if not driver.redispatch or not args.fallback or args.dry_run:
@@ -2356,11 +2365,19 @@ def run_with_fallback(args, driver):
         receipt(first)
         return code
     retry = argparse.Namespace(**vars(args))
-    retry.to, retry.backend = driver.redispatch
+    # The redispatched worker follows its own CC_DELEGATE_<TO>_BACKEND, so a daemon preference
+    # also covers fallback runs; an unusable value must not cost the retry, so it degrades.
+    retry.to = driver.redispatch[0]
+    retry.backend, retry.backend_source = resolve_backend(retry.to, args.mode, None)
+    try:
+        redriver = driver_for(retry.to, retry.backend)
+    except KeyError:
+        retry.backend, retry.backend_source = driver.redispatch[1], "auto"
+        redriver = driver_for(*driver.redispatch)
     retry.model, retry.resume = args.fallback_model, None
     retry.fallback_from = first["task_id"]
     retry.fallback_reason = first.get("reason") or first["status"]
-    return run(retry, driver_for(retry.to, retry.backend))
+    return run(retry, redriver)
 
 
 def control_log(d, action, result, **fields):
@@ -2726,15 +2743,7 @@ def main(argv=None):
     m.add_argument("--note", default="")
     args = parser.parse_args(argv)
     if args.command == "run":
-        env_key = f"CC_DELEGATE_{args.to.upper()}_BACKEND"
-        configured = os.getenv(env_key)
-        if args.backend:
-            args.backend_source = "cli"
-        elif configured is not None:
-            args.backend, args.backend_source = configured, "env"
-        else:
-            args.backend_source = "auto"
-            args.backend = "acp" if args.to == "agy" and args.mode == "write" else "exec"
+        args.backend, args.backend_source = resolve_backend(args.to, args.mode, args.backend)
         try:
             driver = driver_for(args.to, args.backend)
         except KeyError:

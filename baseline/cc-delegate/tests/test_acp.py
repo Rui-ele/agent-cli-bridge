@@ -40,6 +40,7 @@ class AcpCase(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, dict(
             PATH=str(self.bin) + os.pathsep + os.environ["PATH"], HOME=str(self.root),
             CC_DELEGATE_HOME=str(self.root / "cc"), CC_DELEGATE_AGY_BACKEND="acp",
+            CC_DELEGATE_CODEX_BACKEND="exec", CODEX_HOME=str(self.root / "codex"),
             TMPDIR=str(self.root / "tmp"), ACP_TRACE=str(self.trace), ACP_READY=str(self.ready),
             GIT_CEILING_DIRECTORIES=str(self.root), GIT_CONFIG_NOSYSTEM="1")))
         (self.root / "tmp").mkdir()
@@ -205,6 +206,18 @@ class AcpCase(unittest.TestCase):
         self.assertNotEqual(first["exit_code"], 0)
         self.assertEqual((first["backend"], first["status"]), ("acp", "outcome_unknown"))
         self.assertEqual(first["worker_usage"]["total_tokens"], 16)
+
+    def test_redispatch_follows_codex_backend_env(self):
+        self.codex_retry()
+        for value in ("daemon", "bogus"):
+            with self.subTest(value=value), patch.dict(os.environ, {"ACP_STOP": "max_tokens",
+                                                                    "CC_DELEGATE_CODEX_BACKEND": value}):
+                d, meta = self.run_task(fallback=True)
+                run_meta = json.loads((d / "meta.json").read_text())
+                self.assertEqual((meta["worker"], meta["backend"], meta["status"]), ("codex", "exec", "ok"))
+                # No daemon socket exists in the sandboxed CODEX_HOME, so the daemon choice degrades to exec.
+                self.assertEqual(run_meta.get("backend_fallback"),
+                                 "daemon_unavailable" if value == "daemon" else None)
 
     def test_stall_redispatch(self):
         self.codex_retry()
