@@ -437,6 +437,22 @@ class DelegateCase(unittest.TestCase):
     def test_cancel_exec_signals_worker(self):
         self.check_cancel_exec(writing=False)
 
+    def test_status_reads_existing_agy_stream(self):
+        d = cc.home() / "delegate-runs/20261123-120000-agy-abcd"
+        d.mkdir(parents=True)
+        cc.save_json(d / "meta.json", dict(worker="agy", mode="ro", started_at=cc.now()))
+        rows = [
+            {"step_update": {"tool_name": "run_command", "tool_info": {
+                "parameters": {"CommandLine": "pwd"}, "exit_code": 0}}},
+            {"step_update": {"step_type": "message", "text": "checking"}},
+            {"event": "step_update", "step_update": {"tool_name": "run_command", "tool_info": {
+                "parameters": {"CommandLine": "git diff --check"}, "exit_code": 1}}},
+        ]
+        (d / "events.jsonl").write_text("\n".join(cc.dumps(row) for row in rows) + "\n{")
+        lines = self.control("status", d.name).splitlines()
+        self.assertIn('backend="agy"', lines[0])
+        self.assertEqual(lines[1:], ['command="git diff --check" exit_code=1', 'agent_message="checking"'])
+
     def test_cancel_write_keeps_commit_off_onto(self):
         self.check_cancel_exec(writing=True)
 
@@ -795,7 +811,7 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
 
     def test_blocked_overflow_write_without_git_and_unknown_task(self):
         self.write_rows([{"type": "user", "message": {"content": "X"*3000}}])
-        with patch.object(cc, "window", return_value=(500, True)):
+        with patch.object(cc.CodexExec, "window", return_value=(500, True)):
             d, data = self.run_task(expected=1)
         self.assertEqual(data["reason"], "context_overflow")
         self.assertEqual(data["status"], "blocked")
