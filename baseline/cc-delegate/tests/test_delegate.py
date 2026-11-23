@@ -1,12 +1,18 @@
 """Synthetic transcripts and offline CLI doubles. Every writable path is under the checkout."""
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -16,6 +22,170 @@ import cc_delegate as cc
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "cc_delegate.py"
 ANSWER = {"status": "ok", "summary": ["完成"], "uncertainties": [], "report_markdown": "# report"}
+
+
+class FakeDaemon:
+    def __init__(self, case, outcome):
+        self.case, self.outcome = case, outcome
+        self.path = cc.daemon_socket()
+        self.calls = {}
+        self.error = None
+        self.client = None
+        self.proc = None
+
+    @contextlib.contextmanager
+    def serving(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.ExitStack() as stack:
+            listener = stack.enter_context(socket.socket(socket.AF_UNIX))
+            try:
+                listener.bind(os.path.relpath(self.path))
+                stack.callback(self.path.unlink)
+                listener.listen()
+                listener.settimeout(10)
+                accept = lambda: listener.accept()[0]
+            except PermissionError:
+                # Some sandboxes permit local socketpairs but prohibit binding a pathname.
+                peer, self.client = socket.socketpair()
+                stack.enter_context(peer)
+                stack.enter_context(self.client)
+                accept = lambda: peer
+            popen = subprocess.Popen
+
+            def launch(cmd, *args, **kwargs):
+                if "codex-daemon-worker" not in cmd:
+                    return popen(cmd, *args, **kwargs)
+                cmd = list(cmd)
+                index = cmd.index("--socket") + 1
+                self.case.assertEqual(cmd[index], str(self.path))
+                # Darwin's sockaddr_un may be shorter than the temporary checkout's absolute path.
+                if len(os.fsencode(cmd[index])) >= 104:
+                    cmd[index] = os.path.relpath(self.path, kwargs["cwd"])
+                if self.client is not None:
+                    fd = self.client.fileno()
+                    shim = ("import asyncio,runpy,socket,sys;sys.argv=sys.argv[1:];"
+                            f"asyncio.open_unix_connection=lambda path: asyncio.open_connection("
+                            f"sock=socket.socket(fileno={fd}));runpy.run_path(sys.argv[0],run_name='__main__')")
+                    cmd[1:1] = ["-c", shim]
+                    kwargs["pass_fds"] = (fd,)
+                self.proc = popen(cmd, *args, **kwargs)
+                if self.client is not None:
+                    self.client.close()
+                return self.proc
+
+            def serve():
+                try:
+                    with accept() as sock, sock.makefile("rb") as stream:
+                        sock.settimeout(12)
+                        self.script(sock, stream)
+                except Exception as exc:
+                    self.error = exc
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            with patch.object(subprocess, "Popen", launch):
+                try:
+                    yield self
+                finally:
+                    thread.join(15)
+                    self.case.assertFalse(thread.is_alive())
+                    if self.error:
+                        raise self.error
+
+    def script(self, sock, stream):
+        self.case.assertEqual(stream.readline(), b"GET / HTTP/1.1\r\n")
+        headers = dict(line.decode().strip().split(": ", 1) for line in iter(stream.readline, b"\r\n"))
+        key = headers["Sec-WebSocket-Key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept = base64.b64encode(hashlib.sha1(key.encode()).digest())
+        sock.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                     b"Sec-WebSocket-Accept: " + (b"invalid" if self.outcome == "bad_upgrade" else accept) + b"\r\n\r\n")
+        if self.outcome == "bad_upgrade":
+            return
+
+        def read_frame():
+            first, length = stream.read(2)
+            self.case.assertTrue(length & 128)
+            length &= 127
+            if length >= 126:
+                length = int.from_bytes(stream.read(2 if length == 126 else 8), "big")
+            mask = stream.read(4)
+            raw = stream.read(length)
+            self.case.assertEqual(len(raw), length)
+            return first, bytes(b ^ mask[i % 4] for i, b in enumerate(raw))
+
+        def frame(raw, first=129):
+            n = len(raw)
+            length = bytes([n]) if n < 126 else b"\x7e" + struct.pack("!H", n)
+            sock.sendall(bytes([first]) + length + raw)
+
+        def send(msg):
+            frame(cc.dumps(msg).encode())
+
+        def receive():
+            opcode, raw = read_frame()
+            self.case.assertEqual(opcode, 129)
+            return json.loads(raw)
+
+        def call(*methods):
+            msg = receive()
+            self.case.assertIn(msg["method"], methods)
+            self.case.assertEqual(msg["jsonrpc"], "2.0")
+            self.calls[msg["method"]] = msg.get("params")
+            return msg.get("id")
+
+        rid = call("initialize")
+        if self.outcome == "bad_init":
+            send({"id": rid, "error": {"code": -1, "message": "fixture init failed"}})
+            return
+        raw = cc.dumps({"id": rid, "result": {"userAgent": "fixture"}}).encode()
+        frame(raw[:6], 1)
+        frame(b"alive", 137)
+        frame(raw[6:], 128)
+        self.case.assertEqual(read_frame(), (138, b"alive"))
+        call("initialized")
+        rid = call("thread/start", "thread/resume")
+        send({"id": rid, "result": {"thread": {"id": "t1"}}})
+        rid = call("thread/name/set")
+        if "thread/resume" in self.calls:
+            send({"id": rid, "result": {}})
+        else:
+            send({"id": rid, "error": {"code": -1, "message": "name unavailable"}})
+        rid = call("turn/start")
+        turn = {"id": "u1", "status": "inProgress"}
+
+        def notify(method, **params):
+            send({"method": method, "params": {"threadId": "t1", **params}})
+
+        notify("turn/started", turn=turn)
+        send({"id": rid, "result": {"turn": turn}})
+        send({"id": 1, "method": "item/commandExecution/requestApproval", "params": {}})
+        refused = receive()
+        self.case.assertEqual((refused["id"], refused["error"]["code"]), (1, -32601))
+        if self.outcome in ("interrupt", "ignore_interrupt"):
+            self.proc.send_signal(signal.SIGTERM if self.outcome == "interrupt" else signal.SIGINT)
+            rid = call("turn/interrupt")
+            if self.outcome == "ignore_interrupt":
+                started = time.monotonic()
+                self.case.assertEqual(read_frame()[0], 136)
+                self.case.assertLess(time.monotonic() - started, 6)
+                return
+            send({"id": rid, "result": {}})
+            turn["status"] = "interrupted"
+        else:
+            command = {"type": "commandExecution", "id": "cmd", "command": "pwd",
+                       "exitCode": 0, "aggregatedOutput": "here"}
+            notify("item/started", turnId="u1", item=command)
+            notify("item/completed", turnId="u1", item=command)
+            for i, reply in enumerate(("working", cc.dumps(ANSWER))):
+                notify("item/completed", turnId="u1", item={"type": "agentMessage", "id": str(i), "text": reply})
+            for total in (18, 25):
+                counts = dict(inputTokens=17, cachedInputTokens=4, outputTokens=total-17,
+                              reasoningOutputTokens=1, totalTokens=total)
+                notify("thread/tokenUsage/updated", turnId="u1", tokenUsage={"total": counts, "last": {}})
+            notify("turn/completed", turn={"id": "older", "status": "failed"})
+            turn.update(status=self.outcome, error={"message": "fixture failure"} if self.outcome == "failed" else None)
+        notify("turn/completed", turn=turn)
+        self.case.assertEqual(read_frame()[0], 136)
 
 
 class DelegateCase(unittest.TestCase):
@@ -32,6 +202,7 @@ class DelegateCase(unittest.TestCase):
         env = patch.dict(os.environ, {"HOME": str(self.profile), "PATH": str(self.bin) + ":" + os.environ["PATH"],
                                       "CC_DELEGATE_HOME": str(self.profile / ".claude"),
                                       "CODEX_HOME": str(self.profile / ".codex"),
+                                      "CC_DELEGATE_CODEX_BACKEND": "exec",
                                       "GIT_CEILING_DIRECTORIES": str(self.root),
                                       "GIT_CONFIG_NOSYSTEM": "1", "TMPDIR": str(self.root)})
         env.start()
@@ -55,10 +226,100 @@ class DelegateCase(unittest.TestCase):
                             *(["--no-fallback"] if worker == "agy" else [])])
         self.assertEqual(expected, code, buf.getvalue())
         lines = buf.getvalue().splitlines()
+        self.receipt = buf.getvalue()
         self.assertLessEqual(len(lines), 15)
         d = Path(json.loads(lines[-1].split("=", 1)[1]))
         self.assertTrue(d.is_relative_to(self.root))
         return d, json.loads((d / "result.json").read_text())
+
+    def test_daemon_readonly_receipt_and_events(self):
+        self.worker("codex", "sys.exit(19)")
+        with FakeDaemon(self, "completed").serving() as server, \
+                patch.dict(os.environ, {"CC_DELEGATE_CODEX_BACKEND": "daemon"}):
+            d, data = self.run_task("--effort", "high", "--task", "验收" * 12000)
+        self.assertEqual(data, json.loads((d / "meta.json").read_text()))
+        self.assertEqual((data["status"], data["backend"], data["worker_session_id"]), ("ok", "daemon", "t1"))
+        self.assertEqual(data["resume_command"], "codex resume t1")
+        self.assertIn('backend="daemon"', self.receipt)
+        self.assertIn('resume_command="codex resume t1"', self.receipt)
+        self.assertEqual(json.loads((d / "last.txt").read_text()), ANSWER)
+        self.assertEqual(data["worker_usage"], dict(input_tokens=17, cached_input_tokens=4, output_tokens=8,
+                                                    reasoning_output_tokens=1, total_tokens=25))
+        self.assertFalse(server.calls["initialize"]["capabilities"]["experimentalApi"])
+        self.assertEqual(server.calls["thread/start"], dict(cwd=str(self.project), model="synthetic",
+                         approvalPolicy="never", sandbox="read-only", ephemeral=False))
+        self.assertEqual(server.calls["thread/name/set"], dict(threadId="t1", name=d.name))
+        turn = server.calls["turn/start"]
+        self.assertEqual(turn["sandboxPolicy"], dict(type="readOnly", networkAccess=False))
+        self.assertEqual((turn["outputSchema"], turn["effort"]), (cc.SCHEMA, "high"))
+        self.assertEqual(turn["input"], [{"type": "text", "text": (d / "package.md").read_text(), "text_elements": []}])
+        events = list(cc.records(d / "events.jsonl"))
+        cmd = next(e["item"] for e in events if e["type"] == "item.completed")
+        self.assertEqual(cmd, dict(id="cmd", type="command_execution", command="pwd", exit_code=0, aggregated_output="here"))
+        self.assertIn("server_request.rejected", [e["type"] for e in events])
+        self.assertIn("thread.name_failed", [e["type"] for e in events])
+
+    def test_daemon_write_resume(self):
+        self.commit_fixture()
+        self.worker("codex", "sys.exit(19)")
+        with FakeDaemon(self, "completed").serving() as server:
+            d, data = self.run_task("--backend", "daemon", "--mode", "write", "--resume", "t1")
+        checkout = Path(data["worktree"])
+        gitdir, scratch = (str(checkout.parent / (prefix + d.name)) for prefix in (".git-", ".tmp-"))
+        self.assertEqual(server.calls["thread/resume"], dict(threadId="t1", model="synthetic", cwd=str(checkout),
+                         approvalPolicy="never", sandbox="workspace-write", config={"shell_environment_policy.set.TMPDIR": scratch}))
+        self.assertEqual(server.calls["turn/start"]["sandboxPolicy"], dict(type="workspaceWrite",
+                         writableRoots=[gitdir, scratch], networkAccess=False, excludeSlashTmp=True,
+                         excludeTmpdirEnvVar=True))
+        self.assertEqual((data["backend"], data["status"]), ("daemon", "ok"))
+
+    def test_daemon_fallback(self):
+        self.worker("codex", "assert sys.stdin.read().endswith('验收')\n"
+                    "print(json.dumps(" + repr(ANSWER) + "))")
+        for fault in ("missing", "bad_upgrade", "bad_init", "search"):
+            with self.subTest(fault=fault), contextlib.ExitStack() as stack:
+                if fault in ("bad_upgrade", "bad_init"):
+                    stack.enter_context(FakeDaemon(self, fault).serving())
+                else:
+                    stack.enter_context(patch.object(cc, "daemon_socket", return_value=Path("missing.sock")))
+                opts = ["--search"] if fault == "search" else []
+                d, data = self.run_task("--backend", "daemon", *opts)
+                self.assertEqual(data, json.loads((d / "meta.json").read_text()))
+                self.assertEqual((data["backend"], data["status"]), ("exec", "ok"))
+                cmd = cc.shlex.split((d / "command.txt").read_text())
+                self.assertEqual(cmd[0], "codex")
+                self.assertEqual("--search" in cmd, fault == "search")
+                if fault == "search":
+                    self.assertEqual(data["backend_fallback"], "search_unsupported_on_daemon")
+                else:
+                    self.assertEqual(data["backend_fallback"], "daemon_unavailable")
+                    self.assertTrue(data["backend_fallback_reason"])
+                self.assertIn('backend="exec"', self.receipt)
+                self.assertNotIn("resume_command", data)
+
+    def test_daemon_failed_and_interrupted_turn(self):
+        self.worker("codex", "sys.exit(19)")
+        for outcome in ("failed", "interrupt", "ignore_interrupt"):
+            with self.subTest(outcome=outcome), FakeDaemon(self, outcome).serving() as server:
+                d, data = self.run_task("--backend", "daemon", expected=2)
+                self.assertEqual((data["backend"], data["status"], data["exit_code"]), ("daemon", "outcome_unknown", 1))
+                self.assertNotIn("backend_fallback", data)
+                self.assertNotIn("resume_command", data)
+                failure = next(e["error"] for e in cc.records(d / "events.jsonl") if e["type"] == "turn.failed")
+                if outcome != "failed":
+                    self.assertEqual(server.calls["turn/interrupt"], dict(threadId="t1", turnId="u1"))
+                    self.assertEqual(failure, "interrupted" if outcome == "interrupt" else "CancelledError")
+                else:
+                    self.assertEqual(failure["message"], "fixture failure")
+
+    def test_backend_selection(self):
+        with patch.dict(os.environ, {"CC_DELEGATE_CODEX_BACKEND": "daemon"}):
+            d, data = self.run_task("--backend", "exec", "--dry-run")
+            self.assertEqual(data["backend"], "exec")
+            self.assertEqual(cc.shlex.split((d / "command.txt").read_text())[0], "codex")
+            d, data = self.run_task("--backend", "daemon", "--dry-run", worker="agy")
+            self.assertNotIn("backend", data)
+            self.assertEqual(cc.shlex.split((d / "command.txt").read_text())[0], "agy")
 
     def test_transcript_and_tiers(self):
         rows = []

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Delegate a Claude Code task to a local Codex or Antigravity CLI (Python 3.10+)."""
 import argparse
-from contextlib import ExitStack, contextmanager
+import asyncio
+import base64
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
@@ -16,6 +18,7 @@ import secrets
 import selectors
 import shlex
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -429,9 +432,280 @@ def agy_settings(cwd, mode, repo=None):
     return {"permissions": {"deny": sorted(deny)}}
 
 
+DAEMON_UNAVAILABLE = 75  # Only returned before any thread or turn request.
+
+
+def daemon_socket():
+    root = Path(os.getenv("CODEX_HOME", "~/.codex")).expanduser().resolve()
+    return root / "app-server-control/app-server-control.sock"
+
+
+def daemon_event(kind, **fields):
+    print(dumps({"type": kind, **fields}), flush=True)
+
+
+class DaemonConnection:
+    def __init__(self, reader, writer):
+        self.reader, self.writer = reader, writer
+        self.request_id = 0
+        self.upgraded = False
+
+    async def initialize(self):
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.writer.write(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                           "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\n\r\n").encode())
+        head = await self.reader.readuntil(b"\r\n\r\n")
+        status, *lines = head.decode("latin1").strip().split("\r\n")
+        headers = {}
+        for line in lines:
+            name, value = line.split(":", 1)
+            headers[name.lower()] = value.strip()
+        accept = hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+        if (status.split()[:2] != ["HTTP/1.1", "101"] or headers.get("upgrade", "").lower() != "websocket"
+                or "upgrade" not in [s.strip().lower() for s in headers.get("connection", "").split(",")]
+                or headers.get("sec-websocket-accept") != base64.b64encode(accept).decode()):
+            raise ValueError("invalid WebSocket upgrade")
+        self.upgraded = True
+        await self.request("initialize", {"clientInfo": {"name": "cc-delegate", "version": "1"},
+                                          "capabilities": {"experimentalApi": False}})
+        self.send({"method": "initialized"})
+        await self.writer.drain()
+
+    def frame(self, opcode, payload):
+        n = len(payload)
+        if n < 126:
+            length = bytes([128 | n])
+        elif n <= 65535:
+            length = b"\xfe" + struct.pack("!H", n)
+        else:
+            length = b"\xff" + struct.pack("!Q", n)
+        mask = os.urandom(4)
+        self.writer.write(bytes([128 | opcode]) + length + mask
+                          + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def send(self, message):
+        self.frame(1, dumps({"jsonrpc": "2.0", **message}).encode())
+
+    async def receive(self):
+        parts = bytearray()
+        fragmented = False
+        read = self.reader.readexactly
+        while True:
+            first, length = await read(2)
+            opcode, final = first & 15, first & 128
+            if first & 112 or length & 128 or (opcode >= 8 and (not final or length > 125)):
+                raise ValueError("invalid WebSocket frame")
+            if length >= 126:
+                length = int.from_bytes(await read(2 if length == 126 else 8), "big")
+            if opcode in (8, 9, 10):
+                payload = await read(length)
+                if opcode == 8:
+                    self.frame(8, payload)
+                    self.upgraded = False
+                    raise EOFError("daemon closed the WebSocket")
+                if opcode == 9:
+                    self.frame(10, payload)
+                continue
+            if opcode != (0 if fragmented else 1) or len(parts) + length > 64 * 1024 * 1024:
+                raise ValueError("unexpected WebSocket message type or size")
+            parts.extend(await read(length))
+            if final:
+                msg = json.loads(parts.decode())
+                if not isinstance(msg, dict):
+                    raise ValueError("invalid daemon message")
+                return msg
+            fragmented = True
+
+    async def message(self):
+        while True:
+            msg = await self.receive()
+            if msg.get("id") == "name" and "method" not in msg:
+                if "error" in msg:
+                    daemon_event("thread.name_failed", error=msg["error"])
+                continue
+            if "id" not in msg or "method" not in msg:
+                return msg
+            self.send({"id": msg["id"], "error": {"code": -32601, "message": "unsupported server request"}})
+            daemon_event("server_request.rejected", method=msg["method"], id=msg["id"])
+
+    async def request(self, method, params, notifications=None):
+        self.request_id += 1
+        rid = self.request_id
+        self.send({"id": rid, "method": method, "params": params})
+        while True:
+            msg = await self.message()
+            if msg.get("id") == rid:
+                if "error" in msg:
+                    raise ValueError(f"{method}: {msg['error']}")
+                if not isinstance(msg.get("result"), dict):
+                    raise ValueError(f"{method}: missing result object")
+                return msg["result"]
+            if notifications is not None and "method" in msg:
+                notifications.append(msg)
+
+    def close(self):
+        try:
+            if self.upgraded and not self.writer.is_closing():
+                self.frame(8, b"")
+        finally:
+            self.writer.close()
+
+
+class DaemonTurn:
+    def __init__(self, conn):
+        self.conn = conn
+        self.thread = self.turn = None
+        self.submitted = self.stopping = False
+        self.last = self.usage = None
+
+    def interrupt(self):
+        if self.turn:
+            self.conn.send({"id": "interrupt", "method": "turn/interrupt",
+                            "params": {"threadId": self.thread, "turnId": self.turn}})
+
+    def observe(self, msg):
+        method, params = msg.get("method"), msg.get("params", {})
+        turn = params.get("turn", {})
+        if params.get("threadId") != self.thread or (params.get("turnId") or turn.get("id")) != self.turn:
+            return
+        if method == "turn/started":
+            daemon_event("turn.started")
+        elif method in ("item/started", "item/completed"):
+            item = params["item"]
+            kind = item["type"]
+            mapped = {"type": kind, "id": item["id"]}
+            if kind == "agentMessage":
+                mapped.update(type="agent_message", text=item["text"])
+                if method == "item/completed":
+                    self.last = item["text"]
+            elif kind == "commandExecution":
+                mapped.update(type="command_execution", command=item["command"],
+                              exit_code=item.get("exitCode"), aggregated_output=item.get("aggregatedOutput"))
+            daemon_event(method.replace("/", "."), item=mapped)
+        elif method == "thread/tokenUsage/updated":
+            counts = params["tokenUsage"]["total"]
+            self.usage = {re.sub(r"(?=[A-Z])", "_", k).lower(): v for k, v in counts.items()}
+        elif method == "turn/completed":
+            if turn["status"] == "completed":
+                daemon_event("turn.completed", usage=self.usage)
+                return 0
+            daemon_event("turn.failed", error=turn.get("error") or turn["status"])
+            return 1
+
+    async def run(self, args, prompt):
+        writing = args.mode == "write"
+        params = dict(cwd=args.cwd, model=args.model, approvalPolicy="never",
+                      sandbox="workspace-write" if writing else "read-only")
+        sandbox = {"type": "workspaceWrite" if writing else "readOnly", "networkAccess": False}
+        if writing:
+            sandbox.update(writableRoots=args.writable, excludeSlashTmp=True, excludeTmpdirEnvVar=True)
+            if args.tmpdir:
+                params["config"] = {"shell_environment_policy.set.TMPDIR": args.tmpdir}
+        start = dict(input=[{"type": "text", "text": prompt, "text_elements": []}], sandboxPolicy=sandbox)
+        if args.effort:
+            start["effort"] = args.effort
+        if args.schema:
+            start["outputSchema"] = json.loads(safe_file(args.schema).read_text(encoding="utf-8"))
+        if args.resume:
+            result = await self.conn.request("thread/resume", dict(params, threadId=args.resume))
+        else:
+            result = await self.conn.request("thread/start", dict(params, ephemeral=False))
+        self.thread = result["thread"]["id"]
+        daemon_event("thread.started", thread_id=self.thread)
+        if args.thread_name:
+            # Naming is cosmetic. A slow name acknowledgement must not delay the turn.
+            self.conn.send({"id": "name", "method": "thread/name/set",
+                            "params": {"threadId": self.thread, "name": args.thread_name}})
+        early = []
+        self.submitted = True
+        result = await self.conn.request("turn/start", dict(start, threadId=self.thread), early)
+        self.turn = result["turn"]["id"]
+        if self.stopping:
+            self.interrupt()
+        for msg in early:
+            rc = self.observe(msg)
+            if rc is not None:
+                return rc
+        while True:
+            rc = self.observe(await self.conn.message())
+            if rc is not None:
+                return rc
+
+
+async def daemon_worker(args):
+    prompt = sys.stdin.read()
+    conn = turn = None
+    try:
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(args.socket), 5)
+            conn = DaemonConnection(reader, writer)
+            await asyncio.wait_for(conn.initialize(), 5)
+        except (OSError, EOFError, ValueError, KeyError, asyncio.TimeoutError, asyncio.LimitOverrunError) as exc:
+            daemon_event("turn.failed", error=str(exc) or type(exc).__name__)
+            return DAEMON_UNAVAILABLE
+        turn = DaemonTurn(conn)
+        task = asyncio.create_task(turn.run(args, prompt))
+        loop = asyncio.get_running_loop()
+
+        def stop():
+            if turn.stopping:
+                return
+            turn.stopping = True
+            if turn.submitted:
+                loop.call_later(5, task.cancel)
+                turn.interrupt()
+            else:
+                task.cancel()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop)
+        try:
+            return await task
+        finally:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(sig)
+    except (OSError, ValueError, EOFError, KeyError, TypeError, Blocked, asyncio.CancelledError) as exc:
+        daemon_event("turn.failed", error=str(exc) or type(exc).__name__)
+        return 1
+    finally:
+        if conn:
+            conn.close()
+        if turn and turn.last is not None:
+            save_text(Path(args.o), turn.last)
+
+
+def daemon_main(argv):
+    parser = argparse.ArgumentParser(prog="cc_delegate.py codex-daemon-worker")
+    parser.add_argument("--socket", default=str(daemon_socket()))
+    parser.add_argument("--cwd", required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--mode", choices=("ro", "write"), required=True)
+    parser.add_argument("--writable", action="append", default=[])
+    for name in ("tmpdir", "schema", "effort", "resume", "thread-name"):
+        parser.add_argument("--" + name)
+    parser.add_argument("-o", required=True)
+    parser.add_argument("stdin", choices=["-"])
+    return asyncio.run(daemon_worker(parser.parse_args(argv)))
+
+
 def worker_command(args, cwd, run_dir, writable=()):
     schema = str(run_dir / "schema.json")
     if args.to == "codex":
+        if getattr(args, "backend", "exec") == "daemon":
+            cmd = [sys.executable, str(Path(__file__).resolve()), "codex-daemon-worker",
+                   "--socket", str(daemon_socket()), "--cwd", str(cwd), "--model", args.model,
+                   "--mode", args.mode, "--schema", schema, "--thread-name", run_dir.name,
+                   "-o", str(run_dir / "last.txt")]
+            for root in writable:
+                cmd += ["--writable", str(root)]
+            if writable:
+                cmd += ["--tmpdir", str(writable[-1])]
+            if args.effort:
+                cmd += ["--effort", args.effort]
+            if args.resume:
+                cmd += ["--resume", args.resume]
+            return cmd + ["-"]
         cmd = ["codex"]
         if args.search:
             cmd.append("--search")
@@ -1100,7 +1374,7 @@ def receipt(data):
         print(" ".join(field(k, data.get(k), limit) for k in keys))
 
     row("task_id", "status")
-    row("worker_session_id", "model", limit=320)
+    row("worker_session_id", "model", *(k for k in ("backend", "resume_command") if k in data), limit=320)
     row("duration_s", "worker_usage", limit=320)
     for item in data.get("summary", []):
         print(field("summary", item, 320))
@@ -1146,6 +1420,11 @@ def run(args, quiet=False):
                 started_at=now(), duration_s=None, cc_session=None, cc_cost_before=None,
                 cc_cost_after=None, outcome=None, note=None, package_tokens_est=None,
                 redactions=0, loop_warning=False, exit_code=None, report_path=str(d / "report.md"))
+    if args.to == "codex":
+        meta["backend"] = getattr(args, "backend", "exec")
+        if meta["backend"] == "daemon" and args.search:
+            args.backend = meta["backend"] = "exec"
+            meta["backend_fallback"] = "search_unsupported_on_daemon"
     save_json(d / "meta.json", meta)
     events = WorkerEvents(args.to)
     worktree = None
@@ -1223,7 +1502,24 @@ def run(args, quiet=False):
             else:
                 stall = args.stall_seconds or (AGY_STALL_SECONDS if args.to == "agy" else None)
                 env = dict(os.environ, TMPDIR=str(scratch)) if worktree else None
-                rc, stalled = supervise(cmd, cwd, d, prompt, meta, stall, events, finish, env)
+                daemon = meta.get("backend") == "daemon"
+                # A startup failure ends the daemon worker's group, but the retry remains interruptible.
+                with (run_interrupts() if daemon else nullcontext(finish)) as finish_attempt:
+                    rc, stalled = supervise(cmd, cwd, d, prompt, meta, stall, events, finish_attempt, env)
+                if daemon:
+                    if rc == DAEMON_UNAVAILABLE and not stalled:
+                        args.backend = "exec"
+                        meta.update(backend="exec", backend_fallback="daemon_unavailable",
+                                    backend_fallback_reason=events.error, exit_code=None)
+                        # Keep the failed handshake out of the exec raw-output parser.
+                        (d / "events.jsonl").rename(d / "daemon-startup.jsonl")
+                        events = WorkerEvents("codex")
+                        cmd = worker_command(args, cwd, d, writable)
+                        save_text(d / "command.txt", shlex.join(cmd) + "\n")
+                        save_json(d / "meta.json", meta)
+                        rc, stalled = supervise(cmd, cwd, d, prompt, meta, stall, events, finish, env)
+                    elif rc == 0 and events.session:
+                        meta["resume_command"] = shlex.join(["codex", "resume", events.session])
                 if stalled or rc or events.error:
                     reason = "stalled" if stalled else "worker_failed"
                     meta.update(status="outcome_unknown", reason=reason)
@@ -1357,10 +1653,15 @@ def positive(value):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["codex-daemon-worker"]:
+        return daemon_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     r = commands.add_parser("run")
     r.add_argument("--to", required=True, choices=("codex", "agy"))
+    r.add_argument("--backend", choices=("exec", "daemon"),
+                   default=os.getenv("CC_DELEGATE_CODEX_BACKEND", "exec"), help="Codex backend")
     r.add_argument("--model", required=True)
     task = r.add_mutually_exclusive_group(required=True)
     task.add_argument("--task")
@@ -1389,6 +1690,11 @@ def main(argv=None):
     m.add_argument("--cc-session")
     m.add_argument("--note", default="")
     args = parser.parse_args(argv)
+    if args.command == "run":
+        if args.to == "agy":
+            args.backend = "exec"
+        elif args.backend not in ("exec", "daemon"):
+            parser.error("CC_DELEGATE_CODEX_BACKEND must be exec or daemon")
     try:
         return run_with_fallback(args) if args.command == "run" else existing(args)
     except (OSError, ValueError, Blocked) as error:
