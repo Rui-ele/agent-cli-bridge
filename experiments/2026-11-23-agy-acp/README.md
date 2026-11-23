@@ -32,3 +32,19 @@ agy 1.5.14，ACP schema v1（[agentclientprotocol/agent-client-protocol](https:/
 ## 顺带发现（现有 `agy -p` 写模式）
 
 同一个写任务在 `agy -p` 下没能提交：`printf … > probe.txt && git add … && git commit …` 这样的复合命令被 cc-delegate 给 agy 的权限设置拒绝了。这是现有行为，不是这次引入的，但说明 agy 写任务目前很难自己完成提交。
+
+## ACP 驱动实测：与 `agy -p` 对比（同日，cc-delegate `--to agy --backend acp`）
+
+两种方式都用 `gemini-4-neon-high`（ACP 下拆成 `model=gemini-4-neon` 加 `thought_level=high`），同一个测试仓库，同样的任务。
+
+| 场景 | `agy -p`（现有默认） | `agy acp`（新驱动） |
+| --- | --- | --- |
+| 只读：读文件并报告首行 | ok，38 秒，12.7k token | ok，17 秒，21.3k token |
+| 只读：要求创建文件 | blocked，文件没有生成 | blocked，文件没有生成 |
+| 写入：建文件、分两条命令 `git add` 和 `git commit`、再往工作区外 `touch` | 没有提交（复合命令被权限设置拒绝），回复也没通过 schema 校验 | 提交成功并快进到 `--onto` 分支；工作区外的 `touch` 被 Seatbelt 挡住（`Operation not permitted`），所以状态是 partial |
+| `--resume` 续接 | — | 续接到同一个 session，记得上一轮建的文件名 |
+| `cancel` 正在 `sleep` 的写任务 | — | 4.2 秒结束，状态 `cancelled`，没有残留进程 |
+
+- 运行时生成的 Seatbelt profile 只允许写入：`~/.gemini`、`/dev`、系统临时目录、任务克隆目录及其 `.git-<task_id>` 和 `.tmp-<task_id>`。
+- ACP 的 token 用量更高，因为 schema 要求要写进提示文本（ACP 的 prompt 没有 schema 参数）。不过它的耗时更短。
+- 读文件的权限这次没有收紧：客户端拦不住 agy 的读操作。
