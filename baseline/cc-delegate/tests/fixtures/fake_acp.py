@@ -81,7 +81,7 @@ while True:
                 time.sleep(60)
             reason = "cancelled"
         result = dict(stopReason=reason, usage=dict(inputTokens=10, outputTokens=6, cachedReadTokens=2,
-                                                    thoughtTokens=3, totalTokens=16))
+                                                    thoughtTokens=3, totalTokens=int(os.getenv("ACP_TOTAL_TOKENS", "16"))))
     else:
         raise AssertionError(method)
     send(id=req["id"], result=result)

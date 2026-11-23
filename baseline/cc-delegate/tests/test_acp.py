@@ -103,6 +103,13 @@ class AcpCase(unittest.TestCase):
         self.assertIn('command="git status" exit_code=1', out.getvalue())
         self.assertIn("fixture reply", out.getvalue())
 
+    def test_total_excludes_cache_and_thought_subcounts(self):
+        with patch.dict(os.environ, {"ACP_TOTAL_TOKENS": "18"}):
+            _, meta = self.run_task()
+        usage = meta["worker_usage"]
+        self.assertEqual(usage["total_tokens"], usage["input_tokens"] + usage["output_tokens"])
+        self.assertEqual((usage["cached_read_tokens"], usage["thought_tokens"]), (2, 3))
+
     def test_write_turn(self):
         cc.git(self.project, "init", "-q")
         cc.git(self.project, "-c", "user.name=fixture", "-c", "user.email=f@example.invalid",

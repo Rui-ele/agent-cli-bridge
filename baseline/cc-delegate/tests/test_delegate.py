@@ -919,6 +919,71 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         d, data = self.run_task("--mode", "write", "--base", "no-such-ref", expected=1)
         self.assertEqual((data["status"], data["reason"]), ("blocked", "unknown_base_ref"))
 
+    def test_reediting_dirty_file_reports_breach(self):
+        self.commit_fixture()
+        path = self.project / "a"
+        for text, mtime_delta in (("longer", 0), ("edits", 1)):
+            with self.subTest(text=text):
+                path.write_text("dirty")
+                stamp = path.stat().st_mtime_ns + mtime_delta
+                self.worker("codex", f"""
+sys.stdin.read()
+path = Path({str(path)!r})
+path.write_text({text!r})
+os.utime(path, ns=({stamp}, {stamp}))
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))
+""")
+                _, data = self.run_task("--mode", "write")
+                self.assertEqual(data["isolation_breach"], ["status"])
+
+    def test_moving_existing_delegate_ref_reports_breach(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "delegate/earlier")
+        cc.git(self.project, "-c", "user.name=W", "-c", "user.email=w@example.invalid",
+               "commit", "--allow-empty", "-qm", "later")
+        self.worker("codex", f"""
+sys.stdin.read()
+import subprocess
+subprocess.run(["git", "-C", {str(self.project)!r}, "branch", "-f", "delegate/earlier", "HEAD"], check=True)
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))
+""")
+        _, data = self.run_task("--mode", "write")
+        self.assertEqual(data["isolation_breach"], ["refs"])
+
+    def test_launch_failure_does_not_publish_empty_branch(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "feature")
+        with patch.object(cc, "supervise", side_effect=cc.WorkerLaunchError("fixture launch failure")):
+            d, data = self.run_task("--mode", "write", "--onto", "feature", expected=1)
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("onto_skipped_unsuccessful", data["uncertainties"])
+        self.assertNotIn("branch", data)
+        self.assertNotIn("branch", json.loads((d / "meta.json").read_text()))
+        self.assertNotIn("branch=", self.receipt)
+        self.assertFalse(cc.git(self.project, "show-ref", "--verify", "refs/heads/delegate/" + d.name, check=False))
+
+    def test_uncommitted_work_keeps_diff_without_landing(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "feature")
+        self.worker("codex", f"""
+sys.stdin.read()
+Path("a").write_text("work in progress")
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))
+""")
+        d, data = self.run_task("--mode", "write", "--onto", "feature")
+        self.assertEqual(data["changed_files"], ["a"])
+        self.assertIn("onto_no_commits", data["uncertainties"])
+        self.assertNotIn("branch", data)
+        self.assertFalse(cc.git(self.project, "show-ref", "--verify", "refs/heads/delegate/" + d.name, check=False))
+        self.assertEqual(cc.git(self.project, "rev-parse", "feature").strip(), data["base_sha"])
+
+    def test_readonly_rejects_write_refs(self):
+        for option in ("base", "onto"):
+            with self.subTest(option=option):
+                d, data = self.run_task("--mode", "ro", "--" + option, "feature", expected=1)
+                self.assertEqual((data["status"], data["reason"]), ("blocked", option + "_requires_write_mode"))
+                self.assertFalse((d / "command.txt").exists())
+
     def test_onto_fast_forwards_only_the_named_branch(self):
         self.commit_fixture()
         cc.git(self.project, "branch", "feature")
@@ -985,7 +1050,11 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         self.assertEqual(cc.git(self.project, "show", "slow:a"), "before\nslow\n")
         landings = cc.landings_since(Path(cc.git(self.project, "rev-parse", "--path-format=absolute",
                                                  "--git-common-dir").strip()), 0)
-        self.assertEqual(sorted(e["ref"] for e in landings), ["refs/heads/fast", "refs/heads/slow"])
+        expected = []
+        for b, data in results.items():
+            expected.append((f"refs/heads/{b}", data["base_sha"], data["onto_after"]))
+            expected.append((f"refs/heads/delegate/{data['task_id']}", None, data["onto_after"]))
+        self.assertCountEqual([(e["ref"], e["old"], e["new"]) for e in landings], expected)
 
     def test_agy_failure_falls_back_to_codex(self):
         self.worker("agy", "sys.stdin.read()\nsys.exit(3)\n")

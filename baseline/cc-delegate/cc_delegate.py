@@ -19,6 +19,7 @@ import selectors
 import shlex
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -852,6 +853,9 @@ class AcpTurn:
         usage = result.get("usage")
         if usage is not None:
             usage = {re.sub(r"(?=[A-Z])", "_", k).lower(): v for k, v in usage.items()}
+            if isinstance(usage.get("input_tokens"), int) and isinstance(usage.get("output_tokens"), int):
+                # agy already includes cache reads in input and thought tokens in output.
+                usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
         reason = result["stopReason"]
         if reason != "end_turn" or self.stopping:
             worker_event("turn.failed", error=reason if not self.stopping else "cancelled", usage=usage)
@@ -1924,12 +1928,12 @@ def slot(stack, project, common, mode, onto=None):
         raise Blocked("repository_readers_busy")
 
 
-# Sibling write tasks land their --onto branches while this one runs; they record each
-# move here so this task's isolation check can tell those apart from its own worker's.
+# Siblings record fetches and fast-forwards so isolation checks can explain those ref moves.
 LANDINGS = "cc-delegate-landings.jsonl"
 
 
-def record_landing(common, entry):
+def record_landing(common, task_id, ref, old, new):
+    entry = dict(task_id=task_id, ref=ref, old=old, new=new, at=time.time())
     with open(common / LANDINGS, "a", encoding="utf-8") as f:
         f.write(dumps(entry) + "\n")
 
@@ -1950,18 +1954,18 @@ def landings_since(common, since):
     return out
 
 
-def breaches(before, after, landings):
+def breaches(before, after, landings, own_ref=None):
     """Which parts of the user's checkout changed in a way no sibling landing explains."""
     def landed(ref, old, new):
         cur = old
         for e in landings:
-            if e.get("ref") == ref and e.get("old") == cur:
+            if e.get("ref") == ref and e.get("old", UNSET) == cur:
                 cur = e.get("new")
-        return old is not None and cur != old and cur == new
+        return cur != old and cur == new
 
     out = {k for k in ("branch", "status") if before[k] != after[k]}
     moved = {r for r in before["refs"].keys() | after["refs"].keys()
-             if before["refs"].get(r) != after["refs"].get(r)}
+             if r != own_ref and before["refs"].get(r) != after["refs"].get(r)}
     unexplained = {r for r in moved if not landed(r, before["refs"].get(r), after["refs"].get(r))}
     if unexplained:
         out.add("refs")
@@ -1976,16 +1980,18 @@ def breaches(before, after, landings):
 UNTRUSTED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
 
 
-def diff_info(worktree, base):
+def status_paths(status):
     # -z preserves newlines, spaces, quotes and rename pairs in actual file names.
-    changes = git(worktree, *UNTRUSTED, "status", "--porcelain=v1", "-z", "--untracked-files=all").split("\0")
-    paths = set()
-    it = iter(changes)
+    it = iter(status.split("\0"))
     for row in it:
         if row:
-            paths.add(row[3:])
+            yield row[3:]
             if any(c in row[:2] for c in "RC"):
-                paths.add(next(it))
+                yield next(it)
+
+
+def diff_info(worktree, base):
+    paths = set(status_paths(git(worktree, *UNTRUSTED, "status", "--porcelain=v1", "-z", "--untracked-files=all")))
     common = ("diff", "--no-ext-diff", "--no-textconv", "--no-renames")
     changed = git(worktree, *UNTRUSTED, *common, "--name-only", "-z", base, "--")
     paths.update(filter(None, changed.split("\0")))
@@ -2001,12 +2007,21 @@ def checkout_state(repo):
     """What a write task must never change in the user's checkout: branch, refs, worktree."""
     refs = dict(row.split(" ", 1)[::-1] for row in
                 git(repo, "for-each-ref", "--format=%(objectname) %(refname)").splitlines()
-                if row and not row.split(" ", 1)[1].startswith("refs/heads/delegate/"))
+                if row)
+    status = git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    digest = hashlib.sha256(os.fsencode(status))
+    # Re-editing a dirty path keeps its status code. Metadata avoids hashing large files.
+    for name in status_paths(status):
+        try:
+            info = (repo / name).lstat()
+            stamp = "directory" if stat.S_ISDIR(info.st_mode) else f"{info.st_size}:{info.st_mtime_ns}"
+        except (FileNotFoundError, NotADirectoryError):
+            stamp = "missing"
+        digest.update(stamp.encode() + b"\0")
     return {"head": git(repo, "rev-parse", "HEAD", check=False).strip(),
             "branch": git(repo, "symbolic-ref", "-q", "HEAD", check=False).strip(),
             "refs": refs,
-            "status": hashlib.sha256(git(repo, "status", "--porcelain=v1", "-z",
-                                         "--untracked-files=all").encode()).hexdigest()}
+            "status": digest.hexdigest()}
 
 
 def clone_root(repo):
@@ -2027,17 +2042,16 @@ def isolated_checkout(repo, cwd, gitdir, branch, base):
 PROTECTED_BRANCHES = ("main", "master")
 
 
-def land(repo, common, meta, reply):
+def land(repo, common, meta, reply, new):
     """Fast-forward the user's chosen branch to the delegate branch; nothing else moves."""
     onto, old = meta["onto"], meta["onto_before"]
-    new = git(repo, "rev-parse", f"refs/heads/delegate/{meta['task_id']}").strip()
     current = git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False).strip()
     meta["rollback"] = (f"git -C {shlex.quote(str(repo))} reset --keep {old}" if current == onto
                         else f"git -C {shlex.quote(str(repo))} branch -f {shlex.quote(onto)} {old}")
     skip = None
     if meta["status"] not in ("ok", "partial") or meta.get("isolation_breach"):
         skip = "onto_skipped_unsuccessful"
-    elif new == old:
+    elif not new:
         skip = "onto_no_commits"
     elif git(repo, "rev-parse", f"refs/heads/{onto}").strip() != old:
         skip = "onto_branch_moved"
@@ -2052,8 +2066,7 @@ def land(repo, common, meta, reply):
     else:
         git(repo, "update-ref", f"refs/heads/{onto}", new, old)
     meta["onto_after"] = new
-    record_landing(common, {"ref": f"refs/heads/{onto}", "old": old, "new": new,
-                            "task_id": meta["task_id"], "at": time.time()})
+    record_landing(common, meta["task_id"], f"refs/heads/{onto}", old, new)
 
 
 LOG_FIELDS = ("task_id", "worker", "model", "context", "package_tokens_est", "mode", "status",
@@ -2194,6 +2207,11 @@ def run(args, driver, quiet=False):
         try:
             if depth_exceeded:
                 raise Blocked("delegation_depth_exceeded")
+            if args.mode == "ro":
+                if args.onto is not None:
+                    raise Blocked("onto_requires_write_mode")
+                if args.base is not None:
+                    raise Blocked("base_requires_write_mode")
             if not project.is_dir():
                 raise Blocked("project_dir_missing")
             driver.check_available()
@@ -2254,7 +2272,7 @@ def run(args, driver, quiet=False):
                     scratch.mkdir()
                     isolated_checkout(Path(repo), cwd, gitdir, f"delegate/{task_id}", meta["base_sha"])
                     worktree = cwd
-                    meta.update(worktree=str(cwd), branch=f"delegate/{task_id}")
+                    meta["worktree"] = str(cwd)
             attempt = worker_attempt(driver, args, cwd, d, writable, Path(repo) if repo else None,
                                      prompt, meta, finish)
             if attempt is None:
@@ -2306,15 +2324,20 @@ def run(args, driver, quiet=False):
                     # Sibling write tasks fetch and land into the same repository; one at a time.
                     lock(publish, common / "cc-delegate-publish.lock", blocking=True)
                     after = checkout_state(Path(repo))
-                    breach = breaches(before, after, landings_since(common, watch_from))
+                    branch = f"delegate/{task_id}"
+                    ref = f"refs/heads/{branch}"
+                    breach = breaches(before, after, landings_since(common, watch_from), ref)
                     if breach:
                         meta["isolation_breach"] = breach
                         reply["uncertainties"].append("isolation_breach:" + ",".join(breach))
                         if meta["status"] == "ok":
                             meta["status"] = "partial"
                     # Take whatever the worker left checked out, even if it switched branches.
-                    git(Path(repo), *UNTRUSTED, "fetch", "-q", "--no-tags", str(worktree),
-                        f"+HEAD:refs/heads/delegate/{task_id}")
+                    new = git(worktree, *UNTRUSTED, "rev-list", "-1", f"{meta['base_sha']}..HEAD", "--").strip()
+                    if new:
+                        git(Path(repo), *UNTRUSTED, "fetch", "-q", "--no-tags", str(worktree), f"+{new}:{ref}")
+                        meta["branch"] = branch
+                        record_landing(common, task_id, ref, after["refs"].get(ref), new)
                     meta["changed_files"], meta["diff_stat"] = diff_info(worktree, meta["base_sha"])
                 except (OSError, Blocked) as error:
                     publish_error = error
@@ -2327,7 +2350,7 @@ def run(args, driver, quiet=False):
                 reply["uncertainties"] = [u for u in reply["uncertainties"] if u != "worker_failed"]
             if worktree and meta.get("onto") and publish_error is None:
                 try:
-                    land(Path(repo), common, meta, reply)
+                    land(Path(repo), common, meta, reply, new)
                 except (OSError, Blocked) as error:
                     publish_error = error
             if publish_error is not None:
