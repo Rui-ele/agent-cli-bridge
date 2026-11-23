@@ -1404,7 +1404,8 @@ class ClaudePrint(SeatbeltDriver):
         fields = {}
         if events.permission_denials is not None:
             fields["permission_denials"] = events.permission_denials
-        if meta["status"] == "ok" and events.session:
+        # Partial, failed and cancelled runs are the ones a person most often wants to pick up.
+        if events.session:
             fields["resume_command"] = shlex.join(["claude", "--resume", events.session])
         return fields
 

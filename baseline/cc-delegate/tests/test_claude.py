@@ -136,7 +136,7 @@ class ClaudeCase(unittest.TestCase):
                 d, meta = self.run_task("--backend", "print", expected=2 if failure else 0)
                 self.assertEqual(meta["worker"], "claude")
                 self.assertEqual(meta["status"], "outcome_unknown" if failure else "ok")
-                self.assertEqual("resume_command" in meta, not failure)
+                self.assertIn("resume_command", meta)
                 self.assertEqual(meta["loop_warning"], scenario == "loop")
                 if scenario == "text":
                     self.assertEqual((d / "report.md").read_text(), "fixture report")
@@ -227,7 +227,7 @@ class ClaudeCase(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, err)
             meta = json.loads((d / "result.json").read_text())
             self.assertEqual((meta["status"], meta["exit_code"]), ("cancelled", 0))
-            self.assertNotIn("resume_command", meta)
+            self.assertIn("resume_command", meta)
             self.assertIn(("SIGINT", "sent"), [(r["action"], r["result"]) for r in cc.records(d / "control.jsonl")])
         finally:
             if proc.poll() is None:

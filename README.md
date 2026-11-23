@@ -47,6 +47,7 @@
 - 第 2 项：拆出驱动接口，现有三个驱动是 `codex-exec`、`codex-daemon`、`agy-print`。
 - 后两项也已装回。
 - 第 3 项：通用 ACP 驱动（`--to agy --backend acp`），写入由我们自己的 Seatbelt 沙箱限制。实测见 [experiments/2026-11-23-agy-acp](experiments/2026-11-23-agy-acp/README.md)。默认仍是 `agy -p`。已装回。
+- 第 4 项：Claude 驱动（`--to claude`，`claude -p`）。只读用 `dontAsk` 加限定工具；写入用 `bypassPermissions`，边界由 Seatbelt 保证（`acceptEdits` 下复合命令没人审批，提交做不成）。`~/.claude` 只放开 Claude 自己的状态目录。另加了上层的防递归（`CC_DELEGATE_DEPTH`，默认最多两层）。实测见 [experiments/2026-11-23-claude-print](experiments/2026-11-23-claude-print/README.md)。stream-json 连续发消息还没测。
 
 ## 第一个实验
 

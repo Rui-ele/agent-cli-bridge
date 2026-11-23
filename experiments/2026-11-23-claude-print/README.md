@@ -24,8 +24,21 @@
 - 测试仓库一开始建在系统临时目录下。临时目录本身是可写的，所以「往外写」看起来成功了，其实测试是无效的。之后改把测试目录建在家目录下。
 - 一开始把整个 `~/.claude` 设为可写，Bash 也因为 `/private/tmp/claude-<uid>` 不可写而全部失败。上面那份清单就是这样一步步确定下来的。
 
+## 经 cc-delegate 的实测
+
+驱动由 Astra（codex `gpt-6.2-astra`，daemon 后端）按探测结论实现，CC 审阅后补了一处：`resume_command` 原先只在 `ok` 时给出，改为只要有会话就给，因为 `partial`、失败和取消的任务最需要人接手。实测用 `--to claude --model haiku --context none`，测试仓库建在家目录下的临时目录里，不在任何可写路径之内。
+
+| 场景 | 结果 |
+| --- | --- |
+| 只读：读文件 | `ok`，4 秒，约 0.005 美元 |
+| 只读：要求建文件、`touch` | `blocked`。模型看到任务说明是只读，没有尝试写，仓库里没有新文件。沙箱这一层的拦截已经在前面的探测里单独验证过 |
+| 写入：建文件、提交、往仓库外和 `~/.claude` 下 `touch` | `partial`，12 秒。提交落到 `--onto` 分支；两处 `touch` 都被 Seatbelt 拒绝（`Operation not permitted`），模型如实报告 |
+| 续接（`--resume`） | `ok`，同一个会话，答出了上一轮建的文件和提交 |
+| 防递归（`CC_DELEGATE_DEPTH=2`） | 立即 `blocked / delegation_depth_exceeded`，不启动 Claude |
+| 取消（任务里跑 `sleep 123`） | 5 秒结束，状态 `cancelled`，没有残留的 `sleep` |
+
 ## 未核实
 
-- SIGINT 能否让 `claude -p` 干净地结束它启动的子命令（留到驱动实测时做）。
+- `--input-format stream-json` 能否在一个进程里连续发多条消息（路线图第 4 项原本想顺带测，这次没做）。
 - 长任务、子代理、并发、MCP 服务对这份写入清单的影响。
 - 不同模型（sonnet、opus）的结构化输出表现；这次只测了 haiku。
