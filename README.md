@@ -1,8 +1,8 @@
 # Agent CLI Bridge
 
-在 Claude Code（CC）里，把一项代码审阅、调研或修改任务交给本机的 **Codex、另一个 Claude Code 或 Antigravity CLI（agy）**，再把结构化的结果拿回来。核心是一个只用 Python 标准库的脚本：[`baseline/cc-delegate/cc_delegate.py`](baseline/cc-delegate/cc_delegate.py)。
+Claude Code（CC）和 Codex 都可以把代码审阅、调研或修改任务交给本机的 agent CLI，再收回结果。两个发起方共用一个只依赖 Python 标准库的脚本：[`baseline/cc-delegate/cc_delegate.py`](baseline/cc-delegate/cc_delegate.py)。
 
-已在两台 Mac 上实测：MacBook Pro 和 Mac mini，都是由 Claude Code 发起委托。从 Codex 或 agy 反过来委托给 CC，目前还不支持。
+从 CC 发起的委托已在两台 Mac 上实测，接单方包括 Codex、另一个 Claude Code 和 Antigravity CLI（agy）。Codex 发起时加 `--caller codex`，可调 Claude Code 或 agy。agy 发起的委托还有待实现。
 
 ## 让 Claude Code 帮你装
 
@@ -66,11 +66,25 @@ python3 ~/.claude/tools/cc-delegate/cc_delegate.py run \
 
 成功时，终端最后几行是回执，其中有 `status="ok"` 和几条 `summary`。完整报告在回执里 `report_path` 指向的文件。
 
+### 从 Codex 发起
+
+在仓库中可直接运行，例如让 agy 通过 ACP 审阅 README：
+
+```sh
+python3 baseline/cc-delegate/cc_delegate.py run --caller codex \
+  --to agy --backend acp --model gemini-pro-orchestrator-neon \
+  --mode ro --project-dir . --no-fallback --task '读 README，指出最需要澄清的一处。'
+```
+
+调 Claude Code 时将接单参数换成 `--to claude --model haiku`（省略 `--backend acp`）。写入、续接、状态、取消和验收沿用同一套命令。回执和记账中的 `caller` 标明发起方，`--resume` 接的是接单方的会话。
+
+Codex 默认只发送任务和显式指定的文件摘录。要带当前对话，加 `--context scoped`（最近三轮）或 `session`（对话和裁剪过的 shell 记录）。`full` 保留这些 shell 命令的输出，仍受上下文预算和脱敏规则限制。脚本按当前 `CODEX_THREAD_ID` 定位会话，也可用 `--codex-session FILE` 显式指定 rollout。支持的记录是用户消息、助手消息和已完成的 shell 命令；旧格式只有对话消息时只带消息。续接时沿用 worker 的历史。
+
 ## 默认行为和边界
 
 请在用于工作材料之前读完这一节。
 
-- **发出去的上下文**：默认 `--context none`，只发任务文本和固定规则。`--include FILE` 只附上文件的路径和开头几行，接单方需要时会自己去读全文。需要带上 CC 对话时，再显式用 `--context scoped|session|full`：脚本会读取 `~/.claude/projects/` 下该项目最新的会话记录，打包前会脱敏常见的密钥格式，但普通业务内容不会被去掉。
+- **发出去的上下文**：默认 `--context none`，只发任务文本和固定规则。`--include FILE` 只附上文件的路径和开头几行，接单方需要时会自己去读全文。由 CC 发起时，显式用 `--context scoped|session|full` 可带上 CC 对话，默认选该项目最新的 CC 会话。由 Codex 发起时，按上节选取 Codex 会话。两者打包前都会脱敏常见的密钥格式，普通业务内容会保留。
 - **只读和写入**：`--mode ro` 不允许接单方改文件。`--mode write` 在项目旁边的 `../.wt-delegate/<task_id>` 建一个独立克隆，接单方只在克隆里改，你的工作区和分支不会被直接改动。结束后，脚本把提交取回主仓库的 `delegate/<task_id>` 分支；加了 `--onto <已有功能分支>` 时，还会把该分支快进到这个提交。不能是快进、该分支在别的 worktree 里检出、或者 `main`/`master` 时，脚本拒绝移动分支。回执里给出 `rollback` 回退命令。
 - **沙箱只管写，不管读和联网**：接单方能读到你账号能读的所有文件，也能联网。含密钥或凭据的仓库，建议只交给你信任的接单方，或者不要委托。
 - **失败改派默认关闭**：agy 失败或卡死时，可以自动改派给 Codex 重跑，用 `--fallback` 或环境变量 `CC_DELEGATE_AGY_FALLBACK=1` 开启。开启后材料会发给另一家，也会多花一份额度。

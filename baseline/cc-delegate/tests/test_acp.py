@@ -49,9 +49,11 @@ class AcpCase(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n{body}\n")
         path.chmod(0o700)
 
-    def run_task(self, *args, model="synthetic", fallback=False, expected=0):
+    def run_task(self, *args, model="synthetic", fallback=False, expected=0, caller="claude"):
         argv = ["run", "--to", "agy", "--model", model, "--project-dir", str(self.project),
-                "--cc-session", str(self.session), "--task", "test ACP", *args]
+                "--caller", caller, "--task", "test ACP", *args]
+        if caller == "claude":
+            argv += ["--cc-session", str(self.session)]
         argv.append("--fallback" if fallback else "--no-fallback")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -108,6 +110,47 @@ class AcpCase(unittest.TestCase):
         usage = meta["worker_usage"]
         self.assertEqual(usage["total_tokens"], usage["input_tokens"] + usage["output_tokens"])
         self.assertEqual((usage["cached_read_tokens"], usage["thought_tokens"]), (2, 3))
+
+    def test_codex_context_through_acp(self):
+        thread = "00000000-1111-2222-3333-444444444444"
+        folder = Path(os.environ["CODEX_HOME"]) / "sessions/2026/01/01"
+        folder.mkdir(parents=True)
+        path = folder / f"rollout-synthetic-{thread}.jsonl"
+
+        def item(kind, **fields):
+            return dict(type="item_completed", item=dict(type=kind, **fields))
+
+        events = [dict(type="task_started"), dict(type="user_message", message="old conversation"),
+                  item("CommandExecution", id="old", command=["pwd"], aggregated_output="old output")]
+        for i in range(4):
+            events.extend([dict(type="task_started"),
+                           item("UserMessage", content=[{"type": "text", "text": f"question{i}"}]),
+                           dict(type="user_message", message=f"question{i}"),
+                           item("AgentMessage", content=[{"type": "Text", "text": f"answer{i}"}])])
+        events += [item("Reasoning", content=[{"type": "text", "text": "hidden reasoning"}]),
+                   item("CommandExecution", id="1", command=["cat", ".env"], aggregated_output="hidden result"),
+                   item("CommandExecution", id="2", command=["git", "status"], aggregated_output="clean tree")]
+        path.write_text("".join(cc.dumps({"type": "event_msg", "payload": e}) + "\n" for e in events))
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": thread}):
+            for tier in ("scoped", "session", "full"):
+                with self.subTest(tier=tier):
+                    d, meta = self.run_task("--context", tier, caller="codex")
+                    self.assertEqual((meta["caller"], meta["codex_session"], meta["backend"], meta["status"]),
+                                     ("codex", str(path), "acp", "ok"))
+                    prompt = (d / "package.md").read_text()
+                    self.assertIn("[Codex] answer3", prompt)
+                    self.assertEqual(prompt.count("question3"), 1)
+                    self.assertNotIn("hidden", prompt)
+                    self.assertEqual("old conversation" in prompt, tier != "scoped")
+                    self.assertEqual("clean tree" in prompt, tier != "scoped")
+                    self.assertEqual("question0" in prompt, tier != "scoped")
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": ""}):
+            _, meta = self.run_task("--context", "session", caller="codex", expected=1)
+            self.assertEqual(meta["status"], "blocked")
+            _, meta = self.run_task("--context", "session", "--codex-session", str(path), caller="codex")
+            self.assertEqual(meta["status"], "ok")
+            _, meta = self.run_task("--context", "session", "--resume", "fixture-old", caller="codex")
+            self.assertEqual(meta["context"], "none")
 
     def test_write_turn(self):
         cc.git(self.project, "init", "-q")

@@ -114,6 +114,20 @@ class ClaudeCase(unittest.TestCase):
         self.assertIn('command="git status" exit_code=1', out.getvalue())
         self.assertIn('agent_message="checking"', out.getvalue())
 
+    def test_codex_caller_without_transcript(self):
+        self.args = ["run", "--caller", "codex", "--to", "claude", "--model", "fixture",
+                     "--project-dir", str(self.project), "--task", "fixture task"]
+        with patch.object(cc, "session_path", side_effect=AssertionError("unexpected Claude transcript")), \
+                patch.object(cc, "codex_session_path", side_effect=AssertionError("unexpected Codex transcript")):
+            d, meta = self.run_task()
+            self.assertEqual((meta["caller"], meta["status"], meta["cc_session"]), ("codex", "ok", None))
+            self.assertIn("Codex", json.loads(self.trace.read_text())["stdin"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cc.main(["mark", d.name, "--outcome", "accepted"]), 0)
+        self.assertEqual([(r["caller"], r["event"], r["cc_cost_after"])
+                          for r in cc.records(cc.home() / "delegate-log.jsonl")],
+                         [("codex", "run", None), ("codex", "mark", None)])
+
     def test_write(self):
         cc.git(self.project, "init", "-q")
         cc.git(self.project, "-c", "user.name=fixture", "-c", "user.email=f@example.invalid",
@@ -138,6 +152,9 @@ class ClaudeCase(unittest.TestCase):
                 self.assertEqual(meta["status"], "outcome_unknown" if failure else "ok")
                 self.assertIn("resume_command", meta)
                 self.assertEqual(meta["loop_warning"], scenario == "loop")
+                if scenario == "error":
+                    self.assertIn("401 OAuth token expired", self.receipt)
+                    self.assertNotIn("fake-private-value", self.receipt)
                 if scenario == "text":
                     self.assertEqual((d / "report.md").read_text(), "fixture report")
 

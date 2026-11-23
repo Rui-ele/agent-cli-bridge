@@ -39,6 +39,7 @@
   等以后加功能时真的反复被单文件拖累再拆。到时可以开发时分成多个模块，安装时再合成一个文件。
 
 ## 已完成
+- 第 5 项的 Codex 发起方已在仓库实现。通过 `run --caller codex` 调用 Claude 或 agy，按当前线程或指定 rollout 打包对话，任务回执和记账记录发起方。两家只读和写入任务的实测见 [Codex 委托实验](../experiments/2026-11-24-codex-caller.md)。agy 发起方和上层入口仍待定。
 - 放开写任务的并行限制（每个 `--onto` 分支同时只允许一个任务），以及 Codex 守护进程后端 `--backend daemon`。两项都已装回。
 - 第 1 项：`steer`、`cancel`、`status` 三个短命令；第 3 步实测记录见 [experiments/2026-11-23-codex-import](experiments/2026-11-23-codex-import/README.md)。
 - 第 2 项：拆出驱动接口，现有三个驱动是 `codex-exec`、`codex-daemon`、`agy-print`。

@@ -30,7 +30,8 @@ if scenario == "wait":
     time.sleep(30)
 reply = dict(status="ok", summary=["finished"], uncertainties=[], report_markdown="fixture report")
 emit("result", subtype="max_turns" if scenario == "max_turns" else "success",
-     is_error=scenario == "error", session_id=session, result=json.dumps(reply),
+     is_error=scenario == "error", session_id=session,
+     result="401 OAuth token expired, api_key=fake-private-value" if scenario == "error" else json.dumps(reply),
      **({} if scenario == "text" else {"structured_output": dict(reply, report_markdown="structured")}),
      usage=dict(input_tokens=5, output_tokens=7, cache_creation_input_tokens=11, cache_read_input_tokens=13),
      modelUsage={"fixture-model": {}, "fixture-secondary": {}}, total_cost_usd=0.25,
