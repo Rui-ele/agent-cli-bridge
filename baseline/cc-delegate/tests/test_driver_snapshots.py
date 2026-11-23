@@ -1,3 +1,5 @@
+import contextlib
+import io
 """Offline command and settings contracts captured from the original workers."""
 import itertools
 import json
@@ -51,6 +53,15 @@ class DriverSnapshots(unittest.TestCase):
                             (["--", "session"] if resume else []) + ["-"])
                 self.assertEqual(self.command("codex", "exec", mode, search=search,
                                               resume=resume, effort=effort), expected)
+
+    def test_codex_top_efforts_pass_through(self):
+        self.assertIn("ultra", cc.EFFORTS)
+        for effort in ("max", "ultra"):
+            with self.subTest(effort=effort):
+                self.assertIn(f'model_reasoning_effort="{effort}"',
+                              self.command("codex", "exec", "ro", effort=effort))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cc.main(["run", "--to", "codex", "--model", "m", "--task", "t", "--effort", "extreme"])
 
     def test_daemon_argv(self):
         for mode, resume in itertools.product(("ro", "write"), (None, "session")):

@@ -2393,6 +2393,10 @@ def run(args, driver, quiet=False):
     return exit_status(meta["status"])
 
 
+# Codex lists max and ultra (ultra also delegates to sub-agents); other workers reject what they lack.
+EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
+
+
 def resolve_backend(to, mode, explicit):
     if explicit:
         return explicit, "cli"
@@ -2790,7 +2794,7 @@ def main(argv=None):
     r.add_argument("--include", nargs="+", action="extend", default=[])
     r.add_argument("--mode", choices=("ro", "write"), default="ro")
     r.add_argument("--search", action="store_true")
-    r.add_argument("--effort", choices=("low", "medium", "high", "xhigh"))
+    r.add_argument("--effort", choices=EFFORTS)
     r.add_argument("--resume", metavar="WORKER_SESSION_ID")
     r.add_argument("--onto", metavar="BRANCH",
                    help="write mode: start from BRANCH and fast-forward it to the result (not main/master)")
