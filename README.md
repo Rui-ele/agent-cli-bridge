@@ -45,7 +45,7 @@
 - 放开写任务的并行限制（每个 `--onto` 分支同时只允许一个任务），以及 Codex 守护进程后端 `--backend daemon`。两项都已装回。
 - 第 1 项：`steer`、`cancel`、`status` 三个短命令；第 3 步实测记录见 [experiments/2026-11-23-codex-import](experiments/2026-11-23-codex-import/README.md)。
 - 第 2 项：拆出驱动接口，现有三个驱动是 `codex-exec`、`codex-daemon`、`agy-print`。
-- 后两项尚未装回。
+- 后两项也已装回。
 
 ## 第一个实验
 
