@@ -1,16 +1,19 @@
 # Agent CLI Bridge
 
-在 Claude Code 会话里，可以把一次代码审阅交给 Codex，也可以让 Antigravity CLI（agy）在独立克隆中修改代码，再把结果带回原会话。本仓库提供负责传递任务、上下文和结果的 Python 脚本 [cc_delegate.py](baseline/cc-delegate/cc_delegate.py)，并记录这些 CLI 在 macOS 上的实机表现。
+在一个 Claude Code 会话里，你可以把同一项代码审阅或修改任务交给 **Codex、Claude Code 或 Antigravity CLI（agy）**。脚本把任务和所选上下文传给接单方，再把结果带回发起会话。
 
-目前已在 MacBook Pro 上验证从 Claude Code 发起委托，由 Codex、agy 或 Claude Code 接单。从 Codex 或 agy 会话发起委托，以及在 Mac mini 上运行完整流程，仍待验证。
+目前已在 MacBook Pro 上验证由 Claude Code 发起委托。从 Codex 或 agy 会话发起委托，以及在 Mac mini 上运行完整流程，仍待验证。
 
 ## 试一次只读委托
 
-下面的命令从仓库根目录运行。需要 Python 3，以及已登录、可调用所选模型的 agy。用 `agy models` 查看当前账号可用的模型 ID。
+在仓库根目录运行下面的命令。需要 Python 3，并已登录所选接单方的 CLI。`WORKER` 可选 `codex`、`claude` 或 `agy`，`MODEL` 填该 CLI 中你的账号可用的模型 ID。下面以 Codex 为例，切换接单方只需改前两行。
 
 ```sh
+WORKER=codex
+MODEL=gpt-6.2-astra
+
 python3 baseline/cc-delegate/cc_delegate.py run \
-  --to agy --model gemini-pro-orchestrator-neon --no-fallback \
+  --to "$WORKER" --model "$MODEL" \
   --mode ro --context none --include AGENTS.md \
   --task '根据附带的 AGENTS.md，说明写任务应该在哪个分支上进行。'
 ```
