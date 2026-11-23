@@ -26,6 +26,9 @@ import time
 
 RESERVE_RATIO = 0.5
 TERM_GRACE = 10
+# codex exec runs each command in its own process group and only reaps them on SIGINT;
+# SIGTERM leaves them orphaned outside our group (measured 2026-11-23). Ask nicely first.
+INT_GRACE = 5
 LOOP_REPEATS = 3
 # codex exits on its own stream timeout, so it gets no wall-clock stall by default.
 # agy can hang silently (observed: a request with no reply, re-sent only after ~9 min).
@@ -944,20 +947,24 @@ def peek_exit(pid):
 
 def stop_group(proc):
     """Keep the leader's PID reserved through the last destructive signal."""
-    deadline = time.monotonic() + TERM_GRACE
     try:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except PermissionError:
-            os.kill(proc.pid, signal.SIGTERM)
-        while time.monotonic() < deadline:
+        for sig, grace in ((signal.SIGINT, INT_GRACE), (signal.SIGTERM, TERM_GRACE)):
             try:
-                os.killpg(proc.pid, 0)
+                os.killpg(proc.pid, sig)
             except PermissionError:
-                # Darwin can return EPERM for an empty group.
-                if peek_exit(proc.pid) is not None:
-                    break
-            time.sleep(0.05)
+                os.kill(proc.pid, sig)
+            deadline = time.monotonic() + grace
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(proc.pid, 0)
+                except PermissionError:
+                    # Darwin can return EPERM for an empty group.
+                    if peek_exit(proc.pid) is not None:
+                        break
+                time.sleep(0.05)
+            else:
+                continue
+            break
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except PermissionError:
@@ -1746,7 +1753,7 @@ def cancel(d, seconds):
                 control_log(d, "interrupt", "error", error=redact(str(exc))[0][:200])
         else:
             control_log(d, "interrupt", "turn_not_started")
-    for sig, delay in ((signal.SIGTERM, seconds), (signal.SIGKILL, 5)):
+    for sig, delay in ((signal.SIGINT, seconds), (signal.SIGTERM, INT_GRACE), (signal.SIGKILL, 5)):
         if wait_result(result, delay):
             break
         with ExitStack() as stack:

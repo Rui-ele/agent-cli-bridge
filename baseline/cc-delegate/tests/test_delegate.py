@@ -450,7 +450,7 @@ class DelegateCase(unittest.TestCase):
             setup = """import subprocess, signal
 Path("a").write_text("partial work")
 subprocess.run(["git","-c","user.name=W","-c","user.email=w@x.invalid","commit","-qam","partial"], check=True)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) + "))\n"
         table = self.root / "process-table"
         self.worker("codex", setup + f"Path({str(table)!r}).write_text(f'{{os.getpid()}} {{os.getpgrp()}} ' + ' '.join(sys.argv))\n"
@@ -478,10 +478,10 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         data = json.loads((d / "result.json").read_text())
         self.assertIn('status="cancelled"', stdout)
         self.assertEqual(data["reason"], "cancelled_by_user")
-        self.assertEqual(data["exit_code"], 0 if writing else -signal.SIGTERM)
+        self.assertEqual(data["exit_code"], 0 if writing else -signal.SIGINT)
         self.assertEqual(data["worker_pid"], data["worker_pgid"])
         actions = [(r["action"], r["result"]) for r in cc.records(d / "control.jsonl")]
-        self.assertEqual(actions, [("cancel", "requested"), ("SIGTERM", "sent")])
+        self.assertEqual(actions, [("cancel", "requested"), ("SIGINT", "sent")])
         if writing:
             self.assertEqual(cc.git(self.project, "rev-parse", "feature").strip(), data["base_sha"])
             self.assertEqual(cc.git(self.project, "show", f"delegate/{d.name}:a"), "partial work")
@@ -507,10 +507,11 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         match = {43211: f"worker -o {d}/last.txt"}
         for after_term, expected in ((match, 0), ({43210: "another task"}, 1)):
             with self.subTest(expected=expected), patch.object(cc, "wait_result", return_value=False) as wait, \
-                    patch.object(cc, "group_commands", side_effect=[match, after_term]), patch.object(os, "killpg") as kill:
+                    patch.object(cc, "group_commands", side_effect=[match, after_term, after_term]), \
+                    patch.object(os, "killpg") as kill:
                 self.control("cancel", d.name, "--wait", "0", expected=expected)
-                self.assertEqual([call.args[1] for call in wait.call_args_list], [0, 5])
-                signals = [signal.SIGTERM] if expected else [signal.SIGTERM, signal.SIGKILL]
+                self.assertEqual([call.args[1] for call in wait.call_args_list], [0, 5, 5][:3 - expected])
+                signals = [signal.SIGINT] if expected else [signal.SIGINT, signal.SIGTERM, signal.SIGKILL]
                 self.assertEqual([call.args for call in kill.call_args_list], [(43210, sig) for sig in signals])
                 self.assertTrue(any(r["action"] == "interrupt" and r["result"] == "error"
                                     for r in cc.records(d / "control.jsonl")))
@@ -700,7 +701,7 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         self.worker("codex", "sys.stdin.read()\ntime.sleep(60)\n")
         _, data = self.run_task("--stall-seconds", "0.3", expected=2)
         self.assertEqual(data["reason"], "stalled")
-        self.assertEqual(data["exit_code"], -15)
+        self.assertEqual(data["exit_code"], -signal.SIGINT)  # asked to stop first, like Ctrl-C
 
     def test_filesystem_activity_without_stdout(self):
         self.worker("codex", """
@@ -1246,9 +1247,9 @@ sys.stdout.buffer.write(b'{"what":\r"ever"}\n')
             else:
                 calls.append(sig)
 
-        with patch.object(cc, "TERM_GRACE", 0), patch.object(os, "killpg", killpg):
+        with patch.object(cc, "TERM_GRACE", 0), patch.object(cc, "INT_GRACE", 0), patch.object(os, "killpg", killpg):
             self.assertTrue(cc.stop_group(proc))
-        self.assertEqual(calls, [cc.signal.SIGTERM, cc.signal.SIGKILL, "probe", "probe"])
+        self.assertEqual(calls, [cc.signal.SIGINT, cc.signal.SIGTERM, cc.signal.SIGKILL, "probe", "probe"])
         with patch.object(os, "killpg", side_effect=PermissionError), patch.object(os, "kill"), \
                 patch.object(cc, "peek_exit", return_value=0), patch.object(time, "sleep") as sleep:
             self.assertFalse(cc.stop_group(Mock(pid=123)))
