@@ -8,19 +8,17 @@ import shlex
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from unittest.mock import patch
 
 import cc_delegate as cc
+from tests import temp_workspace
 
 
 class AcpCase(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = temp_workspace(self)
         self.project = self.root / "project"
         self.bin = self.root / "bin"
         for path in (self.project, self.bin):
@@ -108,7 +106,9 @@ class AcpCase(unittest.TestCase):
         cc.git(self.project, "init", "-q")
         cc.git(self.project, "-c", "user.name=fixture", "-c", "user.email=f@example.invalid",
                "commit", "--allow-empty", "-qm", "base")
-        d, meta = self.run_task("--mode", "write", "--backend", "acp", model="synthetic-low")
+        del os.environ["CC_DELEGATE_AGY_BACKEND"]
+        d, meta = self.run_task("--mode", "write", model="synthetic-low")
+        self.assertEqual((meta["backend"], meta["backend_source"]), ("acp", "auto"))
         self.assertEqual(self.config(), {"model": "synthetic", "thought_level": "low", "mode": "accept-edits"})
         self.check_permission(d, "allow_once", "yes")
         clone = Path(meta["worktree"])
@@ -165,10 +165,31 @@ class AcpCase(unittest.TestCase):
             with blocked:
                 _, meta = self.run_task(fallback=True, expected=1)
                 self.assertEqual((meta["status"], meta["reason"]), ("blocked", "os_sandbox_unavailable"))
+                self.assertEqual(meta["backend_source"], "env")
                 self.assertFalse(self.trace.exists())
         d, meta = self.run_task("--backend", "exec", "--dry-run")
         self.assertNotIn("backend", meta)
         self.assertEqual(shlex.split((d / "command.txt").read_text())[0], "agy")
+
+    def test_automatic_backend_without_seatbelt(self):
+        del os.environ["CC_DELEGATE_AGY_BACKEND"]
+        cc.git(self.project, "init", "-q")
+        cc.git(self.project, "-c", "user.name=fixture", "-c", "user.email=f@example.invalid",
+               "commit", "--allow-empty", "-qm", "base")
+        for unavailable in (patch.object(cc.sys, "platform", "linux"),
+                            patch.object(cc, "SEATBELT", self.bin / "absent")):
+            with unavailable:
+                d, meta = self.run_task("--mode", "write", "--dry-run")
+                self.assertEqual((meta["backend_source"], meta["backend_fallback"]),
+                                 ("auto", "os_sandbox_unavailable"))
+                self.assertEqual(shlex.split((d / "command.txt").read_text())[:2], ["agy", "--input-format"])
+                _, meta = self.run_task("--mode", "write", "--backend", "acp", expected=1)
+                self.assertEqual((meta["backend_source"], meta["reason"]), ("cli", "os_sandbox_unavailable"))
+                self.assertNotIn("backend_fallback", meta)
+        d, meta = self.run_task("--dry-run")
+        self.assertEqual(meta["backend_source"], "auto")
+        self.assertNotIn("backend_fallback", meta)
+        self.assertEqual(shlex.split((d / "command.txt").read_text())[:2], ["agy", "--input-format"])
 
     def codex_retry(self):
         self.script(self.bin / "codex", "import sys\nfrom pathlib import Path\nsys.stdin.read()\n"

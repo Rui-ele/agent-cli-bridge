@@ -6,19 +6,19 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from unittest.mock import patch
 
 import cc_delegate as cc
+from tests import temp_workspace
 
 
 class ClaudeCase(unittest.TestCase):
     def setUp(self):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        self.root = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])))
+        self.root = temp_workspace(self)
         self.bin = self.root / "bin"
         self.home = self.root / 'home.[a]+("q")\\x'
         self.project = self.root / "project"

@@ -4,19 +4,17 @@ import json
 import os
 from pathlib import Path
 import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 import cc_delegate as cc
+from tests import temp_workspace
 
 
 class DriverSnapshots(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1])
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = temp_workspace(self)
         self.cwd = self.root / "project"
         self.cwd.mkdir()
         self.run_dir = self.root / "task"

@@ -12,13 +12,13 @@ import socket
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
 
 import cc_delegate as cc
+from tests import temp_workspace
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "cc_delegate.py"
@@ -226,9 +226,7 @@ class FakeDaemon:
 
 class DelegateCase(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=ROOT)
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = temp_workspace(self)
         self.project = self.root / "project"
         self.project.mkdir()
         self.bin = self.root / "bin"
@@ -340,7 +338,7 @@ class DelegateCase(unittest.TestCase):
                 d, data = self.run_task("--backend", "daemon", expected=2)
                 self.assertEqual((data["backend"], data["status"], data["exit_code"]), ("daemon", "outcome_unknown", 1))
                 self.assertNotIn("backend_fallback", data)
-                self.assertNotIn("resume_command", data)
+                self.assertEqual(data["resume_command"], "codex resume t1")
                 failure = next(e["error"] for e in cc.records(d / "events.jsonl") if e["type"] == "turn.failed")
                 if outcome != "failed":
                     self.assertEqual(server.calls["turn/interrupt"], dict(threadId="t1", turnId="u1"))
@@ -403,6 +401,7 @@ class DelegateCase(unittest.TestCase):
             d = control.result()
         data = json.loads((d / "result.json").read_text())
         self.assertEqual((rc, data["status"], data["reason"]), (2, "cancelled", "cancelled_by_user"))
+        self.assertEqual(data["resume_command"], "codex resume t1")
         self.assertEqual(server.calls["turn/interrupt"], dict(threadId="t1", turnId="u1"))
         self.assertEqual(json.loads((d / "daemon.json").read_text())["turn_status"], "interrupted")
         log = list(cc.records(d / "control.jsonl"))
@@ -1076,7 +1075,7 @@ print(json.dumps({"event":"result","result":{"structured_output":""" + repr(ANSW
         self.project.mkdir()
         self.worker("agy", 'sys.stdin.read()\nprint(json.dumps({"structured_output":' + repr(ANSWER) + '}))')
         for mode in ("ro", "write"):
-            d, data = self.run_task("--mode", mode, worker="agy")
+            d, data = self.run_task("--mode", mode, "--backend", "exec", worker="agy")
             rules = json.loads((d / "settings.json").read_text())["permissions"]["deny"]
             for path in (repo / ".env", repo / ".git", repo / "alias"):
                 self.assertIn(f"read_file({path})", rules)

@@ -1117,7 +1117,7 @@ class CodexDaemon(CodexDriver):
         return cmd + ["-"]
 
     def receipt_fields(self, meta, events):
-        if meta["exit_code"] == 0 and events.session:
+        if events.session:
             return {"resume_command": shlex.join(["codex", "resume", events.session])}
         return {}
 
@@ -1252,9 +1252,13 @@ def seatbelt_profile(mode, cwd, writable, data_dirs, regexes=()):
     return f"(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{filters})\n"
 
 
+def seatbelt_available():
+    return sys.platform == "darwin" and SEATBELT.is_file() and os.access(SEATBELT, os.X_OK)
+
+
 class SeatbeltDriver(Driver):
     def check_available(self):
-        if sys.platform != "darwin" or not SEATBELT.is_file() or not os.access(SEATBELT, os.X_OK):
+        if not seatbelt_available():
             raise Blocked("os_sandbox_unavailable")
 
 
@@ -1425,6 +1429,11 @@ def driver_for(worker, backend="exec"):
 
 
 def select_driver(args, driver, meta):
+    if args.to == "agy":
+        meta["backend_source"] = args.backend_source
+        if args.backend_source == "auto" and driver.backend == "acp" and not seatbelt_available():
+            meta["backend_fallback"] = "os_sandbox_unavailable"
+            return driver_for("agy", "exec")
     if driver.backend:
         meta["backend"] = driver.backend
     if args.search and not driver.supports_search and driver.fallback_backend:
@@ -1868,8 +1877,14 @@ def git(cwd, *argv, check=True):
     return os.fsdecode(p.stdout) if not p.returncode else ""
 
 
-def lock(stack, path, blocking=False):
-    f = path.open("a+")
+def lock(stack, path, blocking=False, *, create=True):
+    try:
+        f = path.open("a+" if create else "r")
+    except FileNotFoundError:
+        if create:
+            raise
+        # A preview of an older run may precede the first use of this lock.
+        return True
     try:
         fcntl.flock(f, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
     except BlockingIOError:
@@ -1991,6 +2006,10 @@ def checkout_state(repo):
             "refs": refs,
             "status": hashlib.sha256(git(repo, "status", "--porcelain=v1", "-z",
                                          "--untracked-files=all").encode()).hexdigest()}
+
+
+def clone_root(repo):
+    return repo.parent / ".wt-delegate"
 
 
 def isolated_checkout(repo, cwd, gitdir, branch, base):
@@ -2215,7 +2234,8 @@ def run(args, driver, quiet=False):
                     meta["base_ref"] = ref
                     if args.onto:
                         meta.update(onto=args.onto, onto_before=meta["base_sha"])
-                area = Path(repo).parent / ".wt-delegate"
+                meta["repo_dir"] = repo
+                area = clone_root(Path(repo))
                 cwd = area / task_id
                 gitdir, scratch = area / f".git-{task_id}", area / f".tmp-{task_id}"
                 writable = (gitdir, scratch)
@@ -2536,6 +2556,112 @@ def existing(args):
     return 0
 
 
+def prune_branch(repo, task_id, base, dry_run, counts, kept):
+    branch = "delegate/" + task_id
+    ref = "refs/heads/" + branch
+    fmt = "%(refname) %(objectname) %(symref) %(if)%(worktreepath)%(then)checked-out%(end)"
+    rows = git(repo, "for-each-ref", "--format=" + fmt, "refs/heads").splitlines()
+    heads = {}
+    candidates = []
+    for row in rows:
+        name, tip, alias, checkout = row.split(" ")
+        heads[name] = (tip, alias or checkout)
+        if not alias and not name.startswith("refs/heads/delegate/"):
+            candidates.append(tip)
+    if ref not in heads:
+        return
+    tip, busy = heads[ref]
+    if busy or (tip != base and not any(
+            subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", tip, other],
+                           capture_output=True).returncode == 0 for other in candidates)):
+        kept.append(branch)
+        return
+    if not dry_run:
+        # Refuse deletion if another process advanced the branch after the ancestry check.
+        git(repo, "update-ref", "--no-deref", "-d", ref, tip)
+    counts["branches"] += 1
+
+
+def prune_clone(repo, task_id, worktree, dry_run, counts, unsafe):
+    area = clone_root(repo)
+    clone = area / task_id
+    paths = (clone, area / (".git-" + task_id), area / (".tmp-" + task_id))
+    if (Path(worktree) != clone or area.resolve() != area
+            or any(p.is_symlink() or (p.exists() and not p.is_dir()) for p in paths)):
+        unsafe.append(task_id)
+        counts["skipped"] += 1
+        return
+    present = [p for p in paths if p.is_dir()]
+    if not dry_run:
+        for path in present:
+            shutil.rmtree(path)
+    counts["clones"] += bool(present)
+
+
+def prune_run(d, cutoff, dry_run, counts, kept, unsafe):
+    with ExitStack() as stack:
+        result = d / "result.json"
+        metadata = d / "meta.json"
+        if (not TASK_ID.fullmatch(d.name) or d.is_symlink() or not result.is_file() or result.is_symlink()
+                or not metadata.is_file() or metadata.is_symlink() or (d / ".result.lock").is_symlink()
+                or not lock(stack, d / ".result.lock", create=not dry_run)):
+            return False
+        meta = json.loads(metadata.read_text())
+        if not isinstance(meta, dict) or meta["task_id"] != d.name or meta["status"] == "running":
+            return False
+        finished = datetime.fromisoformat(meta["finished_at"])
+        if finished.tzinfo is None or finished.timestamp() >= cutoff:
+            return False
+        project = Path(meta["project_dir"])
+        worktree = meta["worktree"]
+        if not project.is_absolute() or (worktree is not None and not isinstance(worktree, str)):
+            return False
+        recorded = Path(meta.get("repo_dir", project))
+        if not recorded.is_absolute() or not project.is_relative_to(recorded):
+            return False
+        top = git(recorded, "rev-parse", "--show-toplevel", check=False).rstrip("\n")
+        repo = recorded if "repo_dir" in meta or not top else Path(top)
+        if top and Path(top) == repo:
+            common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").rstrip("\n"))
+            # A finishing writer holds publish before result. Never wait in reverse order.
+            if not lock(stack, common / "cc-delegate-publish.lock", create=not dry_run):
+                return False
+            prune_branch(repo, d.name, meta.get("base_sha"), dry_run, counts, kept)
+        if worktree is not None:
+            prune_clone(repo, d.name, worktree, dry_run, counts, unsafe)
+        if not dry_run:
+            shutil.rmtree(d)
+        counts["runs"] += 1
+        return True
+
+
+def prune(args):
+    runs = home() / "delegate-runs"
+    counts = dict(runs=0, clones=0, branches=0, skipped=0)
+    kept, unsafe, errors = [], [], []
+    cutoff = time.time() - args.older_than * 86400
+    if runs.is_symlink():
+        raise Blocked("unsafe_runs_directory")
+    for d in sorted(runs.iterdir()) if runs.is_dir() else ():
+        if d.name == ".locks" or not d.is_dir():
+            continue
+        try:
+            if not prune_run(d, cutoff, args.dry_run, counts, kept, unsafe):
+                counts["skipped"] += 1
+        except (KeyError, TypeError, ValueError, OSError, Blocked, RuntimeError) as exc:
+            counts["skipped"] += 1
+            errors.append(f"{d.name} ({type(exc).__name__})")
+    print(f"dry_run={int(args.dry_run)}")
+    for name, count in counts.items():
+        print(f"{name}={count}")
+    print("kept_branches=" + dumps(kept))
+    if unsafe:
+        print("unsafe_clones=" + dumps(unsafe))
+    if errors:
+        print("errors=" + dumps(errors))
+    return 0
+
+
 def positive(value):
     n = float(value)
     if not math.isfinite(n) or n <= 0:
@@ -2543,7 +2669,7 @@ def positive(value):
     return n
 
 
-def wait_seconds(value):
+def nonnegative(value):
     if float(value) == 0:
         return 0
     return positive(value)
@@ -2561,7 +2687,7 @@ def main(argv=None):
     r.add_argument("--to", required=True, choices=tuple(DRIVERS))
     r.add_argument("--backend", choices=("exec", "daemon", "acp", "print"),
                    help="Codex: exec or daemon. agy: exec (print) or acp. Claude: print or exec. "
-                        "Defaults to CC_DELEGATE_<WORKER>_BACKEND or exec.")
+                        "Defaults to the worker environment setting, then acp for agy writes with Seatbelt or exec.")
     r.add_argument("--model", required=True)
     task = r.add_mutually_exclusive_group(required=True)
     task.add_argument("--task")
@@ -2583,13 +2709,16 @@ def main(argv=None):
     r.add_argument("--no-fallback", dest="fallback", action="store_false",
                    help="agy only: do not re-run on codex when agy stalls or fails")
     r.add_argument("--fallback-model", default="gpt-6.2-astra")
+    p = commands.add_parser("prune")
+    p.add_argument("--older-than", type=nonnegative, default=7, metavar="DAYS")
+    p.add_argument("--dry-run", action="store_true")
     commands.add_parser("status").add_argument("task_id")
     s = commands.add_parser("steer")
     s.add_argument("task_id")
     s.add_argument("--message", required=True)
     c = commands.add_parser("cancel")
     c.add_argument("task_id")
-    c.add_argument("--wait", type=wait_seconds, default=15, metavar="SECONDS")
+    c.add_argument("--wait", type=nonnegative, default=15, metavar="SECONDS")
     m = commands.add_parser("mark")
     m.add_argument("task_id")
     m.add_argument("--outcome", choices=("accepted", "edited", "discarded"), required=True)
@@ -2598,12 +2727,21 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "run":
         env_key = f"CC_DELEGATE_{args.to.upper()}_BACKEND"
-        args.backend = args.backend or os.getenv(env_key, "exec")
+        configured = os.getenv(env_key)
+        if args.backend:
+            args.backend_source = "cli"
+        elif configured is not None:
+            args.backend, args.backend_source = configured, "env"
+        else:
+            args.backend_source = "auto"
+            args.backend = "acp" if args.to == "agy" and args.mode == "write" else "exec"
         try:
             driver = driver_for(args.to, args.backend)
         except KeyError:
             parser.error(f"unsupported {args.to} backend: {args.backend}")
     try:
+        if args.command == "prune":
+            return prune(args)
         return run_with_fallback(args, driver) if args.command == "run" else existing(args)
     except (OSError, ValueError, Blocked) as error:
         print(str(error) if args.command == "steer" else redact(str(error))[0], file=sys.stderr)
