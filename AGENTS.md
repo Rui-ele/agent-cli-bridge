@@ -11,7 +11,7 @@
 ## 开发
 
 - 运行测试：`cd baseline/cc-delegate && python3 -m unittest discover -s tests`。改动后现有测试必须全部通过，新行为要补测试。
-- **只用 Python 标准库。** 这个脚本要打包给非技术用户，不能引入第三方依赖（实验脚本不受此限）。
+- 委托主程序及既有驱动只用 Python 标准库。Codex 调 Claude 的 SDK worker 使用 Anthropic 官方 `claude-agent-sdk`，在独立解释器中运行；其他驱动可以独立安装、测试和使用。实验脚本不受依赖限制。
 - 测试必须完全离线：使用合成会话、模拟 CLI 和假守护进程，不连接真实的 Codex、agy 或 Claude，不联网。需要实机验证的，写进 `experiments/`。
 - 代码风格：保持简洁，注释只写「为什么」。
 - 这里的代码要先在本仓库开发、测试，经维护者同意后，才能装回用户目录（`~/.claude/tools/cc-delegate`）。agent 不要自己去覆盖安装目录。

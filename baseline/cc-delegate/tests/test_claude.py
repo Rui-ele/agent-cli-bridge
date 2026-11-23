@@ -115,7 +115,7 @@ class ClaudeCase(unittest.TestCase):
         self.assertIn('agent_message="checking"', out.getvalue())
 
     def test_codex_caller_without_transcript(self):
-        self.args = ["run", "--caller", "codex", "--to", "claude", "--model", "fixture",
+        self.args = ["run", "--caller", "codex", "--to", "claude", "--backend", "print", "--model", "fixture",
                      "--project-dir", str(self.project), "--task", "fixture task"]
         with patch.object(cc, "session_path", side_effect=AssertionError("unexpected Claude transcript")), \
                 patch.object(cc, "codex_session_path", side_effect=AssertionError("unexpected Codex transcript")):

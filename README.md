@@ -1,6 +1,6 @@
 # Agent CLI Bridge
 
-Claude Code（CC）和 Codex 都可以把代码审阅、调研或修改任务交给本机的 agent CLI，再收回结果。两个发起方共用一个只依赖 Python 标准库的脚本：[`baseline/cc-delegate/cc_delegate.py`](baseline/cc-delegate/cc_delegate.py)。
+Claude Code（CC）和 Codex 都可以把代码审阅、调研或修改任务交给本机的 agent CLI，再收回结果。两个发起方共用标准库脚本 [cc_delegate.py](baseline/cc-delegate/cc_delegate.py)。Codex 调 Claude Code 时，单独的 worker 使用 Anthropic 官方 Python Agent SDK。
 
 从 CC 发起的委托已在两台 Mac 上实测，接单方包括 Codex、另一个 Claude Code 和 Antigravity CLI（agy）。Codex 发起时加 `--caller codex`，可调 Claude Code 或 agy。agy 发起的委托还有待实现。
 
@@ -78,6 +78,20 @@ python3 baseline/cc-delegate/cc_delegate.py run --caller codex \
 
 调 Claude Code 时将接单参数换成 `--to claude --model haiku`（省略 `--backend acp`）。写入、续接、状态、取消和验收沿用同一套命令。回执和记账中的 `caller` 标明发起方，`--resume` 接的是接单方的会话。
 
+首次使用 SDK 后端时准备一个专用 Python 环境，启动委托的进程需要能看到环境变量：
+
+```sh
+python3 -m venv ~/.local/share/cc-delegate/sdk-venv
+~/.local/share/cc-delegate/sdk-venv/bin/python -m pip install 'claude-agent-sdk==0.2.187'
+export CC_DELEGATE_SDK_PYTHON="$HOME/.local/share/cc-delegate/sdk-venv/bin/python"
+```
+
+SDK 复用本机已登录的 `claude`。`run` 在启动时输出 `task_id`。每个任务持有一个 `ClaudeSDKClient`，可以从另一个命令读取进度、发送消息和处理权限请求。需要由发起方处理工具审批时加 `--approval ask`，用 `status` 查看待审批工具、输入和请求 ID，再用 `approve` 或 `deny` 回答。写入继续受独立克隆和 macOS Seatbelt 约束。
+
+要在看过第一轮结果后再决定追问什么，给 `run` 加 `--keep-open`。当 `status` 显示 `state="idle"` 和本轮摘要时，可以用 `queue` 开下一轮，也可以用 `finish` 交付。期间客户端、任务名额和写入克隆持续保留。每轮结果记在任务目录的 `events.jsonl` 中，最终报告取最后一轮，分支交付包含整个任务的提交。中断会停止当前轮，已执行的工具操作仍然保留。结束后再接着改，用 `--resume <worker_session_id>` 恢复对话，并用原目标分支 `--onto` 或上次结果 `--base` 选择代码起点。
+
+SDK 回执的 token 用量按本次任务内的各轮累加，`cost_usd` 来自 SDK 的累计值，续接时可能含以前轮次。运行中追加、排队、中断的实测见[实验记录](experiments/2026-11-24-claude-agent-sdk/README.md)。
+
 Codex 默认只发送任务和显式指定的文件摘录。要带当前对话，加 `--context scoped`（最近三轮）或 `session`（对话和裁剪过的 shell 记录）。`full` 保留这些 shell 命令的输出，仍受上下文预算和脱敏规则限制。脚本按当前 `CODEX_THREAD_ID` 定位会话，也可用 `--codex-session FILE` 显式指定 rollout。支持的记录是用户消息、助手消息和已完成的 shell 命令；旧格式只有对话消息时只带消息。续接时沿用 worker 的历史。
 
 ## 默认行为和边界
@@ -103,7 +117,11 @@ Codex 默认只发送任务和显式指定的文件摘录。要带当前对话�
 | `run …` | 发起委托（参数见 `run --help`） |
 | `status <task_id>` | 查看正在跑的任务的最近命令和消息 |
 | `cancel <task_id>` | 取消任务 |
-| `steer <task_id> --message '…'` | 中途插话，仅 Codex 的 `--backend daemon` 支持 |
+| `steer <task_id> --message '…'` | Codex daemon 中途插话；Claude SDK 立即提交一条消息，由 Claude 决定在哪一轮采纳 |
+| `queue <task_id> --message '…'` | Claude SDK 等当前轮返回结果，再在同一会话发起下一轮 |
+| `finish <task_id>` | 结束空闲的 `--keep-open` 任务，生成最终报告，按原参数交付分支 |
+| `interrupt <task_id> [--message '…']` | Claude SDK 打断当前轮；附带消息时在同一会话继续 |
+| `approve\|deny <task_id> --request-id ID` | 对一个具体的 Claude SDK 工具审批请求作出一次决定 |
 | `mark <task_id> --outcome accepted\|edited\|discarded` | 记下结果有没有用上，用于以后调整分工 |
 | `prune [--older-than DAYS] [--dry-run]` | 清理旧的运行目录、克隆和已合并的分支 |
 
@@ -113,7 +131,7 @@ Codex 默认只发送任务和显式指定的文件摘录。要带当前对话�
 | --- | --- | --- |
 | Codex | `exec`（默认）、`daemon` | `daemon` 连本机 Codex 守护进程，冷启动更快，支持 `steer`，任务会出现在 Codex 客户端的会话列表里；连不上时自动退回 `exec` |
 | agy | `exec`（即 `agy -p`）、`acp` | 写入任务默认走 `acp`（外套 Seatbelt 沙箱，能正常 git 提交）；只读任务默认 `agy -p` |
-| Claude | `print` | `claude -p`，外套 Seatbelt 沙箱 |
+| Claude | `sdk`、`print` | Codex 发起默认使用官方 SDK；CC 发起默认使用原有 print 驱动。两者都通过 Seatbelt 启动本机 Claude CLI |
 
 | 环境变量 | 作用 |
 | --- | --- |

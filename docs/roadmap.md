@@ -8,7 +8,7 @@
 - **底层**：每家 agent 各自的「驱动」。
   - Codex 走 app-server，这是它的原生接口。
   - agy 走 `agy acp`。ACP 是它的原生接口，同时用来验证通用 ACP 驱动。
-  - Claude 先用 `claude -p`，以后需要中途插话时，再换 Agent SDK 或 claude-agent-acp。
+  - Claude 接 Codex 的任务默认走官方 Python Agent SDK；接 CC 的任务默认沿用 `claude -p`。
   - 其他支持 ACP 的 agent 走通用 ACP 驱动。
 
 ## 步骤

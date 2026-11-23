@@ -1388,15 +1388,18 @@ class ClaudePrint(SeatbeltDriver):
                 del env[key]
         return env
 
-    def command(self, args, cwd, run_dir, writable):
+    def profile_text(self, mode, cwd, writable):
         config = Path(cwd) / Path(os.getenv("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
         dirs = [config / name for name in self.state_dirs] + [f"/private/tmp/claude-{os.getuid()}"]
         # Quote the literal home path for the regex before seatbelt_profile quotes the string.
         escapes = str.maketrans({c: "\\" + c for c in r"\.^$*+?()[]{}|"})
         home_pattern = str(Path.home().resolve()).translate(escapes)
         patterns = [r"^/private/tmp/claude-[0-9a-f]+-cwd$", "^" + home_pattern + r"/\.claude\.json"]
+        return seatbelt_profile(mode, cwd, writable, dirs, patterns)
+
+    def command(self, args, cwd, run_dir, writable):
         profile = run_dir / "sandbox.sb"
-        save_text(profile, seatbelt_profile(args.mode, cwd, writable, dirs, patterns))
+        save_text(profile, self.profile_text(args.mode, cwd, writable))
         # Seatbelt already confines writes. A nested sandbox is redundant; conflicts are untested.
         cmd = [str(SEATBELT), "-f", str(profile), "claude", "-p", "--model", args.model,
                "--output-format", "stream-json", "--verbose", "--json-schema",
@@ -1493,8 +1496,78 @@ class ClaudePrint(SeatbeltDriver):
         return fields
 
 
+class ClaudeSDK(ClaudePrint):
+    backend = "sdk"
+
+    def command(self, args, cwd, run_dir, writable):
+        python = os.getenv("CC_DELEGATE_SDK_PYTHON") or sys.executable
+        cli = shutil.which(self.executable)
+        profile = run_dir / "sandbox.sb"
+        rules = self.profile_text(args.mode, cwd, writable)
+        # The CLI must never write its own approvals, even if the run home is under TMPDIR.
+        project = Path(args.project_dir).expanduser().resolve()
+        repository = git(project, "rev-parse", "--show-toplevel", check=False).strip()
+        protected = [run_dir.parent, home() / "delegate-log.jsonl", Path(repository) if repository else project]
+        for root in protected:
+            rules += f"(deny file-write* (subpath {dumps(str(root.resolve()))}))\n"
+        save_text(profile, rules)
+        launcher = run_dir / "claude-sdk-cli"
+        save_text(launcher, "#!/bin/sh\nexec " + shlex.join([str(SEATBELT), "-f", str(profile), cli]) + ' "$@"\n')
+        launcher.chmod(0o700)
+        (run_dir / "sdk-control").mkdir(mode=0o700)
+        worker = Path(__file__).with_name("claude_sdk_worker.py").resolve()
+        cmd = [python, "-I", "-B", str(worker), "--run-dir", str(run_dir), "--cwd", str(cwd),
+               "--cli-path", str(launcher), "--model", args.model, "--mode", args.mode,
+               "--approval", args.approval or "auto"]
+        if args.keep_open:
+            cmd.append("--keep-open")
+        for flag, value in [("--effort", args.effort), ("--resume", args.resume)]:
+            if value:
+                cmd += [flag, value]
+        if args.mode == "ro":
+            for directory in included_dirs(cwd, args.include):
+                cmd += ["--add-dir", str(directory)]
+        return cmd
+
+    def interrupt(self, directory):
+        try:
+            sdk_request(directory, "cancel", timeout=2)
+        except (OSError, Blocked):
+            pass  # cancel() still owns the process group and escalates if necessary.
+
+    def status_events(self, path):
+        fragments, size = [], 0
+        for event in recent_events(path):
+            if event.get("type") in ("assistant", "sdk.turn_result", "result"):
+                break
+            if event.get("type") == "sdk.progress" and isinstance(event.get("text"), str):
+                fragments.append(event["text"])
+                size += len(event["text"])
+                if size >= 200:
+                    break
+        if fragments:
+            yield WorkerEvent(message="".join(reversed(fragments))[-200:])
+        yield from super().status_events(path)
+
+    def print_status(self, directory):
+        try:
+            idle = json.loads((directory / "sdk-control" / "idle.json").read_text())
+        except FileNotFoundError:
+            idle = None
+        if idle is not None:
+            print(f'state="idle" turn={idle["turn"]} turn_status={dumps(idle["status"])}'
+                  f' summary={preview(" ".join(idle.get("summary", [])), 1000)}')
+        for path in sorted((directory / "sdk-control").glob("pending-*.json")):
+            try:
+                pending = json.loads(path.read_text())
+            except FileNotFoundError:
+                continue  # Resolved while status was reading.
+            print(f"approval_id={dumps(pending['request_id'])} tool={preview(pending['tool_name'], 120)}"
+                  f" input={preview(redact(dumps(pending['input']))[0], 1000)} request_path={dumps(str(path))}")
+
+
 DRIVERS = {"codex": {"exec": CodexExec(), "daemon": CodexDaemon()},
-           "agy": {None: AgyPrint(), "acp": AgyAcp()}, "claude": {"print": ClaudePrint()}}
+           "agy": {None: AgyPrint(), "acp": AgyAcp()}, "claude": {"print": ClaudePrint(), "sdk": ClaudeSDK()}}
 TASK_ID = re.compile(r"\d{8}-\d{6}-(?:" + "|".join(map(re.escape, DRIVERS)) + r")-[0-9a-f]{4}")
 
 
@@ -2244,6 +2317,9 @@ def worker_attempt(driver, args, cwd, d, writable, repo, prompt, meta, finish):
         save_json(d / "meta.json", meta)
         if args.dry_run:
             return None
+        if driver.backend == "sdk":
+            # Other invocations need an unambiguous handle before the first approval or idle turn.
+            print(f'task_id={dumps(meta["task_id"])} status="starting" backend="sdk"', flush=True)
         events = WorkerEvents(driver)
         stall = args.stall_seconds or driver.stall_seconds
         # Cleaning up a failed startup must leave the next attempt interruptible.
@@ -2485,12 +2561,14 @@ def run(args, driver, quiet=False):
 EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 
 
-def resolve_backend(to, mode, explicit):
+def resolve_backend(to, mode, explicit, caller="claude"):
     if explicit:
         return explicit, "cli"
     configured = os.getenv(f"CC_DELEGATE_{to.upper()}_BACKEND")
     if configured is not None:
         return configured, "env"
+    if to == "claude" and caller == "codex":
+        return "sdk", "auto"
     return ("acp" if to == "agy" and mode == "write" else "exec"), "auto"
 
 
@@ -2537,6 +2615,38 @@ def control_log(d, action, result, **fields):
     with (d / "control.jsonl").open("a", encoding="utf-8") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.write(dumps(dict(ts=now(), action=action, result=result, **fields)) + "\n")
+
+
+def sdk_request(directory, action, timeout=10, **params):
+    control = directory / "sdk-control"
+    if (directory / "result.json").exists():
+        raise Blocked("task_finished")
+    if not control.is_dir():
+        raise Blocked("sdk_control_not_ready")
+    nonce = secrets.token_hex(16)
+    request, ack = (control / f"{prefix}-{nonce}.json" for prefix in ("req", "ack"))
+    save_json(request, dict(action=action, **params))
+    deadline = time.monotonic() + timeout
+    try:
+        while not ack.exists():
+            if (directory / "result.json").exists():
+                raise Blocked("task_finished_without_ack")
+            if time.monotonic() >= deadline:
+                try:
+                    request.unlink()
+                except FileNotFoundError:
+                    if ack.exists():
+                        break
+                    raise Blocked("sdk_control_timeout_outcome_unknown")
+                raise Blocked("sdk_control_timeout_unclaimed")
+            time.sleep(.05)
+        response = json.loads(ack.read_text())
+        if not response["ok"]:
+            raise Blocked(response["status"])
+        return response
+    finally:
+        request.unlink(missing_ok=True)
+        ack.unlink(missing_ok=True)
 
 
 def steer(d, meta, message):
@@ -2720,8 +2830,28 @@ def existing(args):
             save_json(result, data)
             append_log(data, "mark")
             print(f"{args.task_id} {args.outcome}")
+        elif args.command in ("steer", "queue", "interrupt", "approve", "deny", "finish") and data.get("backend") == "sdk":
+            params = {}
+            if getattr(args, "message", None) is not None:
+                params["message"] = redact(REMINDER.sub("", args.message))[0]
+            if hasattr(args, "request_id"):
+                params["request_id"] = args.request_id
+            response = sdk_request(d, args.command, **params)
+            details = {key: response[key] for key in ("message_uuid",) if response.get(key)}
+            if "request_id" in params:
+                details["request_id"] = args.request_id
+            control_log(d, args.command, response["status"], **details)
+            print(d.name, args.command, response["status"], *(f"{k}={dumps(v)}" for k, v in details.items()))
+            if args.command == "finish":
+                if wait_result(result, 10):
+                    completed = json.loads(result.read_text())
+                    receipt(completed)
+                    return exit_status(completed["status"])
+                print('status="finalizing"')
         elif args.command == "steer":
             steer(d, data, args.message)
+        elif args.command in ("queue", "interrupt", "approve", "deny", "finish"):
+            raise Blocked("requires_claude_sdk_backend")
         elif finished:
             receipt(data)
         else:
@@ -2874,9 +3004,11 @@ def main(argv=None):
     r.add_argument("--caller", choices=("claude", "codex"), default="claude",
                    help="agent delegating the task (default: claude)")
     r.add_argument("--to", required=True, choices=tuple(DRIVERS))
-    r.add_argument("--backend", choices=("exec", "daemon", "acp", "print"),
-                   help="Codex: exec or daemon. agy: exec (alias: print) or acp. Claude: print or exec. "
-                        "Defaults to the worker environment setting, then acp for agy writes with Seatbelt or exec.")
+    r.add_argument("--backend", choices=("exec", "daemon", "acp", "print", "sdk"),
+                   help="Claude: sdk (default from Codex) or print (default from CC). "
+                        "Codex: exec or daemon. agy: exec or acp (default on writes with Seatbelt).")
+    r.add_argument("--approval", choices=("auto", "ask"), help="Claude SDK tool approval policy")
+    r.add_argument("--keep-open", action="store_true", help="keep the SDK client and checkout until finish or cancel")
     r.add_argument("--model", required=True)
     task = r.add_mutually_exclusive_group(required=True)
     task.add_argument("--task")
@@ -2909,9 +3041,18 @@ def main(argv=None):
     p.add_argument("--older-than", type=nonnegative, default=7, metavar="DAYS")
     p.add_argument("--dry-run", action="store_true")
     commands.add_parser("status").add_argument("task_id")
+    commands.add_parser("finish").add_argument("task_id")
     s = commands.add_parser("steer")
     s.add_argument("task_id")
     s.add_argument("--message", required=True)
+    for name in ("queue", "interrupt"):
+        sub = commands.add_parser(name)
+        sub.add_argument("task_id")
+        sub.add_argument("--message", required=name == "queue")
+    for name in ("approve", "deny"):
+        sub = commands.add_parser(name)
+        sub.add_argument("task_id")
+        sub.add_argument("--request-id", required=True)
     c = commands.add_parser("cancel")
     c.add_argument("task_id")
     c.add_argument("--wait", type=nonnegative, default=15, metavar="SECONDS")
@@ -2926,7 +3067,9 @@ def main(argv=None):
             parser.error("--cc-session requires --caller claude")
         if args.codex_session and args.caller != "codex":
             parser.error("--codex-session requires --caller codex")
-        args.backend, args.backend_source = resolve_backend(args.to, args.mode, args.backend)
+        args.backend, args.backend_source = resolve_backend(args.to, args.mode, args.backend, args.caller)
+        if (args.approval or args.keep_open) and args.backend != "sdk":
+            parser.error("--approval and --keep-open require the Claude SDK backend")
         try:
             driver = driver_for(args.to, args.backend)
         except KeyError:
