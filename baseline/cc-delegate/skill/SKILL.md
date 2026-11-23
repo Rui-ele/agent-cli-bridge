@@ -5,7 +5,7 @@ description: Hand work to a local Codex, Antigravity (agy) or second Claude Code
 
 # 用 cc-delegate 委托任务
 
-CC 负责和用户对话、编排和验收，适合外包的活交给本机的其他 agent CLI。脚本说明见 `~/.claude/tools/cc-delegate/README.md`。
+CC 负责和用户对话、编排和验收，适合外包的活交给本机的其他 agent CLI。脚本说明见仓库 README（<https://github.com/Rui-ele/agent-cli-bridge>），参数见 `cc_delegate.py run --help`。
 
 ## 我的分工（按你自己的订阅和习惯填写）
 

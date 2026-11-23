@@ -4,6 +4,16 @@
 
 已在两台 Mac 上实测：MacBook Pro 和 Mac mini，都是由 Claude Code 发起委托。从 Codex 或 agy 反过来委托给 CC，目前还不支持。
 
+## 让 Claude Code 帮你装
+
+在 Mac 上打开 Claude Code，把下面这段话发给它，它会按 [INSTALL.md](INSTALL.md) 一步步装好，需要你点确认、输密码或登录账号时会停下来告诉你：
+
+```text
+请读 https://raw.githubusercontent.com/Rui-ele/agent-cli-bridge/main/INSTALL.md ，按里面的步骤帮我在这台 Mac 上把 cc-delegate 装好。需要我本人操作的地方，停下来告诉我怎么做。
+```
+
+想自己动手装，看下面的「前提」和「安装」。
+
 ## 前提
 
 - **macOS**。脚本用到 `fcntl`，原生 Windows 跑不了。`--to claude` 和 agy 的 ACP 后端靠 macOS 自带的 `/usr/bin/sandbox-exec` 限制写入，Linux 上会以 `os_sandbox_unavailable` 拒绝；Linux 上只能用 `--to codex` 和 `--to agy --backend exec`。
