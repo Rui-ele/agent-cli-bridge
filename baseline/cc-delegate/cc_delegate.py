@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Delegate a Claude Code task to a local Codex or Antigravity CLI (Python 3.10+)."""
+"""Delegate a Claude Code task to a local agent CLI (Python 3.10+)."""
 import argparse
 import asyncio
 import base64
@@ -17,6 +17,7 @@ import re
 import secrets
 import selectors
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -942,10 +943,12 @@ class WorkerEvent:
     item_id: str | None = None
     action: tuple | None = None
     reset_streak: bool = False
+    permission_denials: int | None = None
 
 
-def action_key(action, outcome):
-    return action, hashlib.sha256(dumps(outcome).encode()).hexdigest()
+def action_key(action, outcome, *, sort_keys=False):
+    payload = json.dumps(outcome, ensure_ascii=False, allow_nan=False, sort_keys=sort_keys)
+    return action, hashlib.sha256(payload.encode()).hexdigest()
 
 
 class Driver:
@@ -958,6 +961,7 @@ class Driver:
     stall_seconds = None
     activity_log = None
     reports_agent_pid = False
+    relay_signals = False
     steer = None
 
     def command(self, args, cwd, run_dir, writable):
@@ -969,6 +973,12 @@ class Driver:
     def decode(self, raw):
         raise NotImplementedError
 
+    def translate(self, raw, pending):
+        yield self.decode(raw)
+
+    def status_events(self, path):
+        return (self.decode(raw) for raw in recent_events(path))
+
     def check_available(self):
         pass
 
@@ -976,7 +986,10 @@ class Driver:
         pass
 
     def environment(self, writable):
-        return dict(os.environ, TMPDIR=str(writable[-1])) if writable else None
+        env = dict(os.environ, CC_DELEGATE_DEPTH=str(delegation_depth() + 1))
+        if writable:
+            env["TMPDIR"] = str(writable[-1])
+        return env
 
     def encode_prompt(self, prompt):
         return prompt
@@ -984,7 +997,7 @@ class Driver:
     def output(self, last, events):
         return events.reply
 
-    def receipt_fields(self, rc, events):
+    def receipt_fields(self, meta, events):
         return {}
 
     def interrupt(self, directory):
@@ -1103,8 +1116,8 @@ class CodexDaemon(CodexDriver):
             cmd += ["--resume", args.resume]
         return cmd + ["-"]
 
-    def receipt_fields(self, rc, events):
-        if rc == 0 and events.session:
+    def receipt_fields(self, meta, events):
+        if meta["exit_code"] == 0 and events.session:
             return {"resume_command": shlex.join(["codex", "resume", events.session])}
         return {}
 
@@ -1151,6 +1164,12 @@ class AgyDriver(Driver):
         return AGY_WINDOWS.get(model, 200_000), True
 
 
+def included_dirs(cwd, includes):
+    root = Path(cwd).resolve()
+    dirs = dict.fromkeys((root / Path(p).expanduser()).resolve().parent for p in includes)
+    return [d for d in dirs if not d.is_relative_to(root)]
+
+
 class AgyPrint(AgyDriver):
     activity_log = "agy.log"
 
@@ -1170,13 +1189,7 @@ class AgyPrint(AgyDriver):
             cmd.append("--sandbox")
         else:
             # Let agy read included files that live outside the workspace (plan mode soft-denies them).
-            root = Path(cwd).resolve()
-            extra = []
-            for p in args.include:
-                d = (Path(cwd) / Path(p).expanduser()).resolve().parent
-                if root != d and root not in d.parents and d not in extra:
-                    extra.append(d)
-            for d in extra:
+            for d in included_dirs(cwd, args.include):
                 cmd += ["--add-dir", str(d)]
         if args.effort:
             cmd += ["--effort", args.effort]
@@ -1225,7 +1238,7 @@ class AgyPrint(AgyDriver):
 SEATBELT = Path("/usr/bin/sandbox-exec")
 
 
-def seatbelt_profile(mode, cwd, writable, data_dirs):
+def seatbelt_profile(mode, cwd, writable, data_dirs, regexes=()):
     roots = [*data_dirs, "/private/var/folders", "/dev"]
     if os.getenv("TMPDIR"):
         roots.append(os.environ["TMPDIR"])
@@ -1233,17 +1246,21 @@ def seatbelt_profile(mode, cwd, writable, data_dirs):
         roots.extend((cwd, *writable))
     # Agents can read directly without client filesystem RPCs. This profile confines writes only.
     paths = sorted({str(Path(root).expanduser().resolve()) for root in roots})
-    filters = "\n".join(f"    (subpath {dumps(path)})" for path in paths)
+    rules = [f"    (subpath {dumps(path)})" for path in paths]
+    rules.extend(f"    (regex {dumps(pattern)})" for pattern in regexes)
+    filters = "\n".join(rules)
     return f"(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n{filters})\n"
 
 
-class AgyAcp(AgyDriver, ItemEventDriver):
-    backend = "acp"
-    reports_agent_pid = True
-
+class SeatbeltDriver(Driver):
     def check_available(self):
         if sys.platform != "darwin" or not SEATBELT.is_file() or not os.access(SEATBELT, os.X_OK):
             raise Blocked("os_sandbox_unavailable")
+
+
+class AgyAcp(SeatbeltDriver, AgyDriver, ItemEventDriver):
+    backend = "acp"
+    reports_agent_pid = True
 
     def command(self, args, cwd, run_dir, writable):
         profile = run_dir / "sandbox.sb"
@@ -1260,8 +1277,140 @@ class AgyAcp(AgyDriver, ItemEventDriver):
         return cmd + ["--", "agy", "acp"]
 
 
+class ClaudePrint(SeatbeltDriver):
+    backend = "print"
+    relay_signals = True
+    # Leave host settings, skills, hooks, tools and other delegation runs read-only.
+    state_dirs = ("projects", "sessions", "session-env", "shell-snapshots", "state", "cache",
+                  "file-history", "todos", "plans", "debug", "statsig", "telemetry", "backups",
+                  "paste-cache", "ide")
+
+    def check_available(self):
+        super().check_available()
+        if not shutil.which("claude"):
+            raise WorkerLaunchError("claude executable not found in PATH")
+
+    def window(self, model):
+        return (1_000_000 if model.endswith("[1m]") else 200_000), True
+
+    def environment(self, writable):
+        # A parent CC session exports its ID, message sockets and CLAUDE_CODE_SIMPLE=1.
+        # Keep the provider and login choices so the child can use the same account.
+        env = super().environment(writable)
+        for key in list(env):
+            if key.startswith("CLAUDE_CODE_USE_") or key == "CLAUDE_CODE_OAUTH_TOKEN":
+                continue
+            if key in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT") or key.startswith(
+                    ("CLAUDE_CODE_", "CLAUDE_AGENT_SDK_", "CLAUDE_PREVIEW_")):
+                del env[key]
+        return env
+
+    def command(self, args, cwd, run_dir, writable):
+        config = Path(cwd) / Path(os.getenv("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
+        dirs = [config / name for name in self.state_dirs] + [f"/private/tmp/claude-{os.getuid()}"]
+        # Quote the literal home path for the regex before seatbelt_profile quotes the string.
+        escapes = str.maketrans({c: "\\" + c for c in r"\.^$*+?()[]{}|"})
+        home_pattern = str(Path.home().resolve()).translate(escapes)
+        patterns = [r"^/private/tmp/claude-[0-9a-f]+-cwd$", "^" + home_pattern + r"/\.claude\.json"]
+        profile = run_dir / "sandbox.sb"
+        save_text(profile, seatbelt_profile(args.mode, cwd, writable, dirs, patterns))
+        # Seatbelt already confines writes. A nested sandbox is redundant; conflicts are untested.
+        cmd = [str(SEATBELT), "-f", str(profile), "claude", "-p", "--model", args.model,
+               "--output-format", "stream-json", "--verbose", "--json-schema",
+               (run_dir / "schema.json").read_text(), "--permission-prompts", "none",
+               "--settings", '{"sandbox":{"enabled":false}}']
+        if args.mode == "ro":
+            # Read-only Bash commands are useful here because Seatbelt enforces the write boundary.
+            cmd += ["--permission-mode", "dontAsk", "--allowedTools",
+                    "Read", "Grep", "Glob", "Bash", "WebSearch", "WebFetch"]
+            for d in included_dirs(cwd, args.include):
+                cmd += ["--add-dir", str(d)]
+        else:
+            # acceptEdits prompts for compound shell commands. In -p there is nobody to
+            # approve git commits, so rely on the outer Seatbelt write boundary.
+            cmd += ["--permission-mode", "bypassPermissions"]
+        if args.effort:
+            cmd += ["--effort", args.effort]
+        if args.resume:
+            cmd += ["--resume", args.resume]
+        return cmd
+
+    def decode(self, raw):
+        if raw.get("type") == "system" and raw.get("subtype") == "init":
+            return WorkerEvent(session=raw.get("session_id") or UNSET)
+        if raw.get("type") != "result":
+            return WorkerEvent()
+        counts = raw.get("usage") or {}
+        usage = {k: counts.get(k, 0) for k in ("input_tokens", "output_tokens",
+                 "cache_creation_input_tokens", "cache_read_input_tokens")}
+        usage.update(total_tokens=sum(usage.values()), cost_usd=raw.get("total_cost_usd"),
+                     actual_models=list(raw.get("modelUsage") or {}))
+        reply = raw.get("structured_output")
+        failed = raw.get("is_error") or raw.get("subtype") != "success"
+        return WorkerEvent(session=raw.get("session_id") or UNSET, usage=usage,
+                           reply=dumps(reply) if reply is not None else raw.get("result", ""),
+                           error=(raw.get("result") or "claude_error") if failed else UNSET,
+                           permission_denials=len(raw.get("permission_denials") or []))
+
+    def translate(self, raw, pending):
+        kind = raw.get("type")
+        if kind in ("assistant", "user"):
+            for block in (raw.get("message") or {}).get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                typ = block.get("type")
+                if kind == "assistant" and typ == "text":
+                    yield WorkerEvent(message=block.get("text"))
+                elif kind == "assistant" and typ == "tool_use" and block.get("id"):
+                    name, params = block.get("name"), block.get("input") or {}
+                    action = json.dumps([name, params], sort_keys=True, ensure_ascii=False)
+                    command = params.get("command") if name == "Bash" else action
+                    pending[block["id"]] = (command, action, None)
+                    yield WorkerEvent(command=(command, None))
+                elif kind == "user" and typ == "tool_result":
+                    call_id = block.get("tool_use_id")
+                    if call_id not in pending:
+                        continue
+                    command, action, _ = pending[call_id]
+                    code = int(bool(block.get("is_error")))
+                    key = action_key(action, [code, block.get("content")], sort_keys=True)
+                    pending[call_id] = (command, action, key)
+                    yield WorkerEvent(command=(command, code))
+                    # Parallel tools may finish out of order. Count consecutive *calls*.
+                    while pending:
+                        first = next(iter(pending))
+                        key = pending[first][2]
+                        if key is None:
+                            break
+                        del pending[first]
+                        yield WorkerEvent(action=key, item_id=first)
+        else:
+            yield self.decode(raw)
+
+    def status_events(self, path):
+        # The call and result live on separate lines. Replay in order to join their IDs.
+        last = WorkerEvent()
+        pending = {}
+        if path.is_file():
+            for raw in records(path):
+                for event in self.translate(raw, pending):
+                    if event.command is not None:
+                        last.command = event.command
+                    if event.message is not None:
+                        last.message = event.message
+        yield last
+
+    def receipt_fields(self, meta, events):
+        fields = {}
+        if events.permission_denials is not None:
+            fields["permission_denials"] = events.permission_denials
+        if meta["status"] == "ok" and events.session:
+            fields["resume_command"] = shlex.join(["claude", "--resume", events.session])
+        return fields
+
+
 DRIVERS = {"codex": {"exec": CodexExec(), "daemon": CodexDaemon()},
-           "agy": {None: AgyPrint(), "acp": AgyAcp()}}
+           "agy": {None: AgyPrint(), "acp": AgyAcp()}, "claude": {"print": ClaudePrint()}}
 TASK_ID = re.compile(r"\d{8}-\d{6}-(?:" + "|".join(map(re.escape, DRIVERS)) + r")-[0-9a-f]{4}")
 
 
@@ -1269,6 +1418,8 @@ def driver_for(worker, backend="exec"):
     choices = DRIVERS[worker]
     if worker == "agy" and backend in ("exec", "daemon"):
         return choices[None]
+    if worker == "claude" and backend in (None, "exec"):
+        return choices["print"]
     return choices[backend]
 
 
@@ -1323,6 +1474,8 @@ class WorkerEvents:
         self.reply = ""
         self.error = None
         self.item_ids = set()
+        self.pending_tools = {}
+        self.permission_denials = None
         self.loop_warning = False
         self.last_action = None
         self.streak = 0
@@ -1344,7 +1497,14 @@ class WorkerEvents:
     def observe(self, raw):
         if not isinstance(raw, dict):
             return
-        event = self.driver.decode(raw)
+        warning = None
+        for event in self.driver.translate(raw, self.pending_tools):
+            warning = self.apply(event) or warning
+        return warning
+
+    def apply(self, event):
+        if event.permission_denials is not None:
+            self.permission_denials = event.permission_denials
         for name in ("session", "usage", "reply", "error"):
             value = getattr(event, name)
             if value is not UNSET:
@@ -1546,9 +1706,19 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
             # start_new_session makes the child's PID its process group ID.
             meta.update(worker_pid=proc.pid, worker_pgid=proc.pid)
             save_json(run_dir / "meta.json", meta)
-            if (run_dir / "cancel.requested").exists():
-                raise Blocked("cancelled_by_user")
-            with selectors.DefaultSelector() as sel:
+            with ExitStack() as io_stack:
+                sel = io_stack.enter_context(selectors.DefaultSelector())
+                if events.driver.relay_signals:
+                    # sandbox-exec drops its profile path from argv on exec. Relay to our
+                    # own unreaped child instead of guessing a group from its new argv.
+                    fifo = run_dir / "cancel.fifo"
+                    os.mkfifo(fifo, 0o600)
+                    io_stack.callback(fifo.unlink)
+                    fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+                    io_stack.callback(os.close, fd)
+                    sel.register(fd, selectors.EVENT_READ, "signal")
+                if (run_dir / "cancel.requested").exists():
+                    raise Blocked("cancelled_by_user")
                 for pipe, event, name in [(proc.stdin, selectors.EVENT_WRITE, "stdin"),
                                           (proc.stdout, selectors.EVENT_READ, "stdout"),
                                           (proc.stderr, selectors.EVENT_READ, "stderr")]:
@@ -1557,7 +1727,7 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
 
                 def worker_open():
                     # The network monitor never closes on its own; only worker pipes count.
-                    return any(key.data != "net" for key in sel.get_map().values())
+                    return any(key.data not in ("net", "signal") for key in sel.get_map().values())
 
                 while worker_open() or peek_exit(proc.pid) is None:
                     if monitor_pid is not None:
@@ -1573,6 +1743,12 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
                         time.sleep(tick)
                     for key, _ in ready:
                         pipe, channel = key.fileobj, key.data
+                        if channel == "signal":
+                            for sig in os.read(pipe, 128):
+                                if sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+                                    os.killpg(proc.pid, sig)
+                                    control_log(run_dir, signal.Signals(sig).name, "sent")
+                            continue
                         if channel == "net":
                             try:
                                 chunk = os.read(pipe, 65536)
@@ -1700,6 +1876,10 @@ def lock(stack, path, blocking=False):
         return False
     stack.enter_context(f)
     return True
+
+
+def delegation_depth():
+    return max(0, int(os.getenv("CC_DELEGATE_DEPTH", "0")))
 
 
 def env_limit(name, default):
@@ -1945,22 +2125,33 @@ def worker_attempt(driver, args, cwd, d, writable, repo, prompt, meta, finish):
             meta["backend"] = driver.backend
             (d / "events.jsonl").rename(startup_log)
             continue
-        meta.update(driver.receipt_fields(rc, events))
         return rc, stalled, events
 
 
-def run(args, driver, quiet=False):
-    project = Path(args.project_dir).expanduser().resolve()
+def new_run_directory(worker):
     runs = home() / "delegate-runs"
     runs.mkdir(mode=0o700, parents=True, exist_ok=True)
     while True:
-        task_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{args.to}-{secrets.token_hex(2)}"
+        task_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{worker}-{secrets.token_hex(2)}"
         d = runs / task_id
         try:
             d.mkdir(mode=0o700)
-            break
+            return d
         except FileExistsError:
             continue
+
+
+def run(args, driver, quiet=False):
+    depth_exceeded = delegation_depth() >= int(os.getenv("CC_DELEGATE_MAX_DEPTH", "2"))
+    try:
+        d = new_run_directory(args.to)
+    except PermissionError:
+        # A nested worker's sandbox can deny creating even a blocked run's receipt.
+        if depth_exceeded:
+            raise Blocked("delegation_depth_exceeded")
+        raise
+    task_id = d.name
+    project = Path(args.project_dir).expanduser().resolve()
     start = time.monotonic()
     tier = "none" if args.resume else args.context
     meta = dict(fallback_from=getattr(args, "fallback_from", None),
@@ -1973,11 +2164,13 @@ def run(args, driver, quiet=False):
                 redactions=0, loop_warning=False, exit_code=None, report_path=str(d / "report.md"))
     driver = select_driver(args, driver, meta)
     save_json(d / "meta.json", meta)
-    worktree = None
+    worktree = events = None
     reply = dict(summary=[], uncertainties=[], report_markdown="")
     with ExitStack() as stack:
         finish = stack.enter_context(run_interrupts())
         try:
+            if depth_exceeded:
+                raise Blocked("delegation_depth_exceeded")
             if not project.is_dir():
                 raise Blocked("project_dir_missing")
             driver.check_available()
@@ -2119,6 +2312,8 @@ def run(args, driver, quiet=False):
                 meta.setdefault("reason", "diff_collection_failed")
                 reply["uncertainties"].extend(["diff_collection_failed", str(publish_error)])
         meta.update(duration_s=round(time.monotonic()-start, 3), finished_at=now())
+        if events is not None:
+            meta.update(events.driver.receipt_fields(meta, events))
         save_text(d / "report.md", reply["report_markdown"])
         meta.update(summary=reply["summary"], uncertainties=reply["uncertainties"])
         save_json(d / "meta.json", meta)
@@ -2211,7 +2406,8 @@ def cancel(d, seconds):
         (d / "cancel.requested").touch()
         control_log(d, "cancel", "requested")
         meta = json.loads((d / "meta.json").read_text())
-    recorded_driver(meta).interrupt(d)
+    driver = recorded_driver(meta)
+    driver.interrupt(d)
     for sig, delay in ((signal.SIGINT, seconds), (signal.SIGTERM, INT_GRACE), (signal.SIGKILL, 5)):
         if wait_result(result, delay):
             break
@@ -2219,6 +2415,15 @@ def cancel(d, seconds):
             lock(stack, d / ".result.lock", blocking=True)
             if result.is_file():
                 break
+            if driver.relay_signals:
+                try:
+                    fd = os.open(d / "cancel.fifo", os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                    with os.fdopen(fd, "wb", buffering=0) as fifo:
+                        fifo.write(bytes([sig]))
+                except OSError as exc:
+                    control_log(d, sig.name, "worker_not_found")
+                    raise Blocked("worker_not_found") from exc
+                continue
             pgid = json.loads((d / "meta.json").read_text()).get("worker_pgid")
             if not any(str(d) in cmd for cmd in group_commands(pgid).values()):
                 control_log(d, sig.name, "worker_not_found")
@@ -2279,8 +2484,7 @@ def running_status(d, meta):
     print(f'task_id={d.name} status="running" elapsed_s={max(0, int(elapsed.total_seconds()))}'
           f' backend={dumps(backend)} mode={dumps(meta["mode"])}')
     command = message = code = None
-    for raw in recent_events(d / "events.jsonl"):
-        event = driver.decode(raw)
+    for event in driver.status_events(d / "events.jsonl"):
         if command is None and event.command is not None:
             command, code = event.command
         if message is None:
@@ -2354,8 +2558,8 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     r = commands.add_parser("run")
     r.add_argument("--to", required=True, choices=tuple(DRIVERS))
-    r.add_argument("--backend", choices=("exec", "daemon", "acp"),
-                   help="Codex: exec or daemon. agy: exec (print) or acp. "
+    r.add_argument("--backend", choices=("exec", "daemon", "acp", "print"),
+                   help="Codex: exec or daemon. agy: exec (print) or acp. Claude: print or exec. "
                         "Defaults to CC_DELEGATE_<WORKER>_BACKEND or exec.")
     r.add_argument("--model", required=True)
     task = r.add_mutually_exclusive_group(required=True)

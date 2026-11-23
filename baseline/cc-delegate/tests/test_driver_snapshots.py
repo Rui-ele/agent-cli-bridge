@@ -101,3 +101,35 @@ class DriverSnapshots(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(cc.agy_settings(cwd, mode, self.cwd),
                                  {"permissions": {"deny": sorted(common + extra)}})
+
+    def test_agy_acp_profile_bytes(self):
+        self.run_dir.mkdir()
+        tmp = self.root / 't"mp\\dir'
+        common = [self.home / ".gemini", tmp, Path("/dev"), Path("/private/var/folders")]
+        with patch.dict(os.environ, {"TMPDIR": str(tmp)}):
+            for mode in ("ro", "write"):
+                with self.subTest(mode=mode):
+                    self.command("agy", "acp", mode)
+                    paths = common + ([self.cwd, self.gitdir, self.scratch] if mode == "write" else [])
+                    paths = sorted(str(p.resolve()) for p in paths)
+                    golden = ("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n" +
+                              "\n".join("    (subpath " + json.dumps(p, ensure_ascii=False) + ")" for p in paths) + ")\n")
+                    self.assertEqual((self.run_dir / "sandbox.sb").read_bytes(), golden.encode())
+
+    def test_claude_argv(self):
+        self.run_dir.mkdir()
+        cc.save_json(self.run_dir / "schema.json", cc.SCHEMA)
+        for mode, resume, effort in itertools.product(("ro", "write"), (None, "session"), (None, "high")):
+            with self.subTest(mode=mode, resume=resume, effort=effort):
+                expected = [str(cc.SEATBELT), "-f", str(self.run_dir / "sandbox.sb"), "claude", "-p",
+                            "--model", "test-model", "--output-format", "stream-json", "--verbose",
+                            "--json-schema", (self.run_dir / "schema.json").read_text(),
+                            "--permission-prompts", "none", "--settings", '{"sandbox":{"enabled":false}}']
+                if mode == "ro":
+                    expected += ["--permission-mode", "dontAsk", "--allowedTools", "Read", "Grep", "Glob",
+                                 "Bash", "WebSearch", "WebFetch", "--add-dir", str(self.root / "shared")]
+                else:
+                    expected += ["--permission-mode", "bypassPermissions"]
+                expected += (["--effort", "high"] if effort else []) + (["--resume", "session"] if resume else [])
+                self.assertEqual(self.command("claude", "print", mode, resume=resume, effort=effort,
+                                              include=["local", "../shared/a", "../shared/b"]), expected)
