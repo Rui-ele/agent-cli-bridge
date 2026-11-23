@@ -49,6 +49,7 @@
 - 第 3 项：通用 ACP 驱动（`--to agy --backend acp`），写入由我们自己的 Seatbelt 沙箱限制。实测见 [experiments/2026-11-23-agy-acp](experiments/2026-11-23-agy-acp/README.md)。默认仍是 `agy -p`。已装回。
 - 第 4 项：Claude 驱动（`--to claude`，`claude -p`）。只读用 `dontAsk` 加限定工具；写入用 `bypassPermissions`，边界由 Seatbelt 保证（`acceptEdits` 下复合命令没人审批，提交做不成）。`~/.claude` 只放开 Claude 自己的状态目录。另加了上层的防递归（`CC_DELEGATE_DEPTH`，默认最多两层）。实测见 [experiments/2026-11-23-claude-print](experiments/2026-11-23-claude-print/README.md)。stream-json 连续发消息还没测。
 - 小修：agy 写入任务默认改走 ACP（只读仍是 `agy -p`；没有 Seatbelt 时自动退回，显式指定 `--backend acp` 则拒绝）；理由是 `agy -p` 写入时复合命令被拒、提交做不成，而 ACP 能提交、能续接和取消。新增 `prune` 清理结束超过 7 天的运行目录、克隆和已合并的 `delegate/*` 分支，未合并的分支保留；测试临时目录集中到被忽略的 `.test-tmp/`；Codex 守护进程任务只要有会话就给 `resume_command`。第 4 项和这些小修都已装回。
+- 路由规则双审（Astra 加 Neon 编排模型）发现的改派问题已修复并装回：改派会按 `CC_DELEGATE_CODEX_BACKEND` 选后端；带 `--onto` 的写入任务也能改派；带 `--resume` 的任务不再改派；只读任务改派时自动加 `--search`，并沿用模型名里的强度档位；`--context none` 也会附上 `--include` 的文件。
 
 ## 第一个实验
 
