@@ -725,13 +725,15 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         self.worker("codex", """
 sys.stdin.read()
 last = Path(sys.argv[sys.argv.index("-o")+1])
-for _ in range(8):
+for _ in range(20):
     time.sleep(.1)
     last.touch()
 last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
-        _, data = self.run_task("--stall-seconds", "0.4")
+        # The window must cover a cold interpreter start before the first touch (0.4 s misfired
+        # on fresh machines); the run still outlasts it, so only file activity keeps it alive.
+        _, data = self.run_task("--stall-seconds", "1.5")
         self.assertEqual(data["status"], "ok")
-        self.assertGreater(data["duration_s"], .8)
+        self.assertGreater(data["duration_s"], 1.5)
 
     def test_repo_locks(self):
         (cc.home() / "delegate-runs").mkdir(parents=True)
