@@ -2157,7 +2157,9 @@ def receipt(data):
     if data.get("fallback_skipped"):
         flags.append("fallback_skipped")
     if data.get("fallback_from"):
-        flags += ["fallback_from", "fallback_reason"]
+        # Kept alongside the summary line: installed skills match on this field.
+        data = dict(data, fallback="agy 失败，已自动改派 Codex")
+        flags += ["fallback", "fallback_from", "fallback_reason"]
     row(*flags, limit=320)
     if data.get("mode") == "write":
         extra = [field("onto", data["onto"]), field("rollback", data.get("rollback"))] if data.get("onto") else []

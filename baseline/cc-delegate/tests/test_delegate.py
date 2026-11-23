@@ -1119,6 +1119,7 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         self.assertLessEqual(len(out.splitlines()), 15)
         summaries = [line for line in out.splitlines() if line.startswith("summary=")]
         self.assertIn("agy 失败（worker_failed），已自动改派 Codex", summaries[0])
+        self.assertIn('fallback="agy 失败，已自动改派 Codex"', out)
         self.assertIn('fallback_reason="worker_failed"', out)
         data = json.loads((Path(json.loads(out.splitlines()[-1].split("=", 1)[1])) / "result.json").read_text())
         self.assertEqual((data["worker"], data["model"], data["status"]), ("codex", "gpt-6.2-astra", "ok"))
