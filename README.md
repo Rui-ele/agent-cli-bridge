@@ -135,6 +135,7 @@ python3 "$delegate" rollback TASK_ID
 - `CC_DELEGATE_SDK_PYTHON` 指向的解释器以宿主权限运行。请指向你自己创建并信任的环境，避免使用待审项目里的 `.venv`。
 - **发出去的上下文**：默认 `--context none`，只发任务文本和固定规则。`--include FILE` 只附上文件的路径和开头几行，接单方需要时会自己去读全文。由 CC 发起时，显式用 `--context scoped|session|full` 可带上 CC 对话，默认选该项目最新的 CC 会话。由 Codex 发起时，按上节选取 Codex 会话。两者打包前都会脱敏常见的密钥格式，普通业务内容会保留。
 - **只读和写入**：`--mode ro` 限制接单方修改项目文件。Claude 需要在 `~/.claude/projects/<项目>/` 写入自己的会话记录，因此只读任务也能改动该目录下其他 CC 会话的记录。默认的 Git 写入模式在项目旁边的 `../.wt-delegate/<task_id>` 建一个独立克隆，接单方只在克隆里改，你的工作区和分支不会被直接改动。结束后，脚本把提交取回主仓库的 `delegate/<task_id>` 分支；加了 `--onto <已有功能分支>` 时，还会把该分支快进到这个提交。不能是快进、该分支在别的 worktree 里检出、或者 `main`/`master` 时，脚本拒绝移动分支。回执里给出 `rollback` 回退命令。
+- **并发名额**。同一仓库默认允许 4 个写入任务同时运行，只读任务默认不限。名额满时，`run` 会输出任务号和 `status="queued"`。排队中可用 `status` 查看、用 `cancel` 取消。拿到名额后才创建克隆或工作区并启动接单方。默认最多等 30 分钟，超时返回 `repository_readers_busy` 或 `repository_writers_busy`。目标分支已被另一个 `--onto` 任务锁定时立即返回 `onto_branch_busy`。`--workspace files` 的同目录写入冲突仍立即返回 `files_workspace_busy`。
 - **Claude 的登录过期后，沙箱里刷新不了**：`--to claude` 在沙箱里运行，过期的登录令牌没法自动刷新，委托会报 401（`OAuth access token has expired`）。在终端里直接运行一次 `claude -p "say ok"` 刷新登录，再重新委托即可。原因推测是刷新要写钥匙串，被沙箱挡住了，未核实。
 - **沙箱只管写，不管读和联网**：接单方能读到你账号能读的所有文件，也能联网。含密钥或凭据的仓库，建议只交给你信任的接单方，或者不要委托。
 - **失败改派默认关闭**：agy 失败或卡死时，可以自动改派给 Codex 重跑，用 `--fallback` 或环境变量 `CC_DELEGATE_AGY_FALLBACK=1` 开启。开启后材料会发给另一家，也会多花一份额度。
@@ -153,7 +154,8 @@ python3 "$delegate" rollback TASK_ID
 | 命令 | 作用 |
 | --- | --- |
 | `run …` | 发起委托（参数见 `run --help`） |
-| `status <task_id>` | 查看正在跑的任务的最近命令和消息 |
+| `run … --shadow` | 发起影子任务，跳过仓库名额并关闭失败改派。继续遵守 `--onto` 分支锁和普通文件夹的写入锁，任务元数据和记账标记 `shadow: true` |
+| `status <task_id>` | 查看排队状态、运行中任务的最近命令和消息，或已完成任务的回执 |
 | `cancel <task_id>` | 取消任务 |
 | `steer <task_id> --message '…'` | Codex daemon 中途插话；Claude SDK 立即提交一条消息，由 Claude 决定在哪一轮采纳 |
 | `queue <task_id> --message '…'` | Claude SDK 等当前轮返回结果，再在同一会话发起下一轮 |
@@ -175,7 +177,9 @@ python3 "$delegate" rollback TASK_ID
 | --- | --- |
 | `CC_DELEGATE_CODEX_BACKEND`、`CC_DELEGATE_AGY_BACKEND` | 各接单方的默认后端 |
 | `CC_DELEGATE_AGY_FALLBACK=1` | agy 失败时改派 Codex |
-| `CC_DELEGATE_MAX_WRITERS`、`CC_DELEGATE_MAX_READERS` | 同一仓库同时跑的写入、只读任务上限（默认 4、3） |
+| `CC_DELEGATE_MAX_WRITERS` | 同一仓库的写入任务上限，默认 4，可设正整数 |
+| `CC_DELEGATE_MAX_READERS` | 同一仓库的只读任务上限，设正整数才限制 |
+| `CC_DELEGATE_SLOT_WAIT` | 名额满时的最长等待秒数，默认 1800，设 `0` 立即返回 busy |
 | `CC_DELEGATE_MAX_DEPTH` | 委托深度上限（默认 2） |
 | `CC_DELEGATE_HOME` | 运行目录和记账的位置（默认 `~/.claude`） |
 

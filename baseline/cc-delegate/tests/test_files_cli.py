@@ -198,8 +198,9 @@ class FilesCLI(unittest.TestCase):
                 while not ready.exists() and first.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.03)
                 self.assertTrue(ready.is_file())
-                _, result = self.run_task("--mode", "write", "--workspace", "files", expected=1)
-                self.assertEqual(result["reason"], "files_workspace_busy")
+                for flags in ([], ["--shadow"]):
+                    _, result = self.run_task("--mode", "write", "--workspace", "files", *flags, expected=1)
+                    self.assertEqual(result["reason"], "files_workspace_busy")
             finally:
                 release.touch()
                 output, _ = first.communicate(timeout=8)

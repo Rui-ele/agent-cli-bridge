@@ -259,7 +259,7 @@ class DelegateCase(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             code = cc.main(["run", "--to", worker, "--model", "synthetic", "--cc-session",
                             str(self.session), "--project-dir", str(self.project), "--task", "验收", *args,
-                            *(["--no-fallback"] if worker == "agy" else [])])
+                            *(["--no-fallback"] if worker == "agy" and "--fallback" not in args else [])])
         self.assertEqual(expected, code, buf.getvalue())
         lines = buf.getvalue().splitlines()
         self.receipt = buf.getvalue()
@@ -735,38 +735,131 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
         self.assertEqual(data["status"], "ok")
         self.assertGreater(data["duration_s"], 1.5)
 
-    def test_repo_locks(self):
-        (cc.home() / "delegate-runs").mkdir(parents=True)
-        with contextlib.ExitStack() as stack:
-            # Writers run in private clones, so several share a repository; one per --onto branch.
-            cc.slot(stack, self.project, self.project, "write", "feature")
-            with self.assertRaisesRegex(cc.Blocked, "onto_branch_busy"):
-                cc.slot(stack, self.project, self.project, "write", "feature")
-            cc.slot(stack, self.project, self.project, "write", "other")
-            cc.slot(stack, self.project, self.project, "write")
-            cc.slot(stack, self.project, self.project, "write")
-            with self.assertRaisesRegex(cc.Blocked, "writers_busy"):
-                cc.slot(stack, self.project, self.project, "write")
-            for _ in range(3):
-                cc.slot(stack, self.project, self.project, "ro")
-            with self.assertRaisesRegex(cc.Blocked, "readers_busy"):
-                cc.slot(stack, self.project, self.project, "ro")
-        with contextlib.ExitStack() as stack:
-            cc.slot(stack, self.project, self.project, "write", "feature")
-        with patch.dict(os.environ, {"CC_DELEGATE_MAX_READERS": "5", "CC_DELEGATE_MAX_WRITERS": "1"}), \
-                contextlib.ExitStack() as stack:
-            for _ in range(5):
-                cc.slot(stack, self.project, self.project, "ro")
-            with self.assertRaisesRegex(cc.Blocked, "readers_busy"):
-                cc.slot(stack, self.project, self.project, "ro")
-            cc.slot(stack, self.project, self.project, "write")
-            with self.assertRaisesRegex(cc.Blocked, "writers_busy"):
-                cc.slot(stack, self.project, self.project, "write")
-        with patch.dict(os.environ, {"CC_DELEGATE_MAX_READERS": "zero"}), contextlib.ExitStack() as stack:
-            for _ in range(3):  # unparsable limits fall back to the default
-                cc.slot(stack, self.project, self.project, "ro")
-            with self.assertRaisesRegex(cc.Blocked, "readers_busy"):
-                cc.slot(stack, self.project, self.project, "ro")
+    def hold_slot(self, stack, mode, onto=None, *, shadow=False):
+        d = cc.new_run_directory("codex")
+        meta = dict(task_id=d.name, mode=mode, shadow=shadow)
+        cc.slot(stack, d, meta, self.project, self.project / ".git", onto)
+
+    @contextlib.contextmanager
+    def queued_task(self, *args):
+        cmd = [sys.executable, str(SCRIPT), "run", "--to", "codex", "--model", "synthetic",
+               "--cc-session", str(self.session), "--project-dir", str(self.project), "--task", "x", *args]
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+            try:
+                deadline = time.monotonic() + 5
+                while proc.poll() is None and time.monotonic() < deadline:
+                    for path in (cc.home() / "delegate-runs").glob("*/meta.json"):
+                        if json.loads(path.read_text())["status"] == "queued":
+                            yield proc, path.parent
+                            return
+                    time.sleep(.02)
+                self.fail("task did not queue")
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.communicate(timeout=5)
+
+    def test_repo_slot_defaults(self):
+        self.commit_fixture()
+        with patch.dict(os.environ, CC_DELEGATE_SLOT_WAIT="0"), contextlib.ExitStack() as stack:
+            os.environ.pop("CC_DELEGATE_MAX_READERS", None)
+            os.environ.pop("CC_DELEGATE_MAX_WRITERS", None)
+            for _ in range(12):
+                self.hold_slot(stack, "ro")
+            pool = cc.home() / "delegate-runs" / ".locks"
+            self.assertFalse(pool.exists())
+            for _ in range(4):
+                self.hold_slot(stack, "write")
+            with self.assertRaisesRegex(cc.Blocked, "repository_writers_busy"):
+                self.hold_slot(stack, "write")
+
+    def test_queued_task_starts_after_slot_release(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "feature")
+        self.worker("codex", "sys.stdin.read()\nprint(json.dumps(" + repr(ANSWER) + "))")
+        for mode in ("ro", "write"):
+            with self.subTest(mode=mode), patch.dict(os.environ, CC_DELEGATE_MAX_READERS="1",
+                    CC_DELEGATE_MAX_WRITERS="1"), contextlib.ExitStack() as held:
+                os.environ.pop("CC_DELEGATE_SLOT_WAIT", None)
+                self.hold_slot(held, mode)
+                onto = ["--onto", "feature"] if mode == "write" else []
+                with self.queued_task("--mode", mode, *onto) as (proc, d):
+                    self.assertIn('status="queued"', self.control("status", d.name))
+                    self.assertFalse((d / "events.jsonl").exists())
+                    self.assertFalse(cc.clone_root(self.project).exists())
+                    if onto:
+                        with contextlib.ExitStack() as probe:
+                            self.assertTrue(cc.lock(probe, self.project / ".git/cc-delegate-publish.lock"))
+                        cc.git(self.project, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                               "commit", "--allow-empty", "-qm", "advance")
+                        cc.git(self.project, "branch", "-f", "feature", "HEAD")
+                        new_head = cc.git(self.project, "rev-parse", "HEAD").strip()
+                    held.close()
+                    output, _ = proc.communicate(timeout=8)
+                    self.assertEqual(proc.returncode, 0, output)
+                    self.assertIn('status="queued"', output)
+                    result = json.loads((d / "result.json").read_text())
+                    self.assertEqual(result["status"], "ok")
+                    self.assertFalse(result["shadow"])
+                    if onto:
+                        self.assertEqual(result["base_sha"], new_head)
+
+    def test_slot_timeout_and_zero_wait_keep_busy_reasons(self):
+        self.commit_fixture()
+        for mode, busy in (("ro", "repository_readers_busy"), ("write", "repository_writers_busy")):
+            for wait in ("0.25", "0"):
+                with self.subTest(mode=mode, wait=wait), patch.dict(os.environ, CC_DELEGATE_MAX_READERS="1",
+                        CC_DELEGATE_MAX_WRITERS="1", CC_DELEGATE_SLOT_WAIT=wait), contextlib.ExitStack() as held:
+                    self.hold_slot(held, mode)
+                    d, result = self.run_task("--mode", mode, expected=1)
+                    self.assertEqual((result["status"], result["reason"]), ("blocked", busy))
+                    self.assertEqual('status="queued"' in self.receipt, wait != "0")
+                    self.assertFalse((d / "events.jsonl").exists())
+                    self.assertFalse(cc.clone_root(self.project).exists())
+
+    def test_cancel_queued_task_without_starting_worker(self):
+        self.commit_fixture()
+        with patch.dict(os.environ, CC_DELEGATE_MAX_WRITERS="1", CC_DELEGATE_SLOT_WAIT="10"), \
+                contextlib.ExitStack() as held:
+            self.hold_slot(held, "write")
+            with self.queued_task("--mode", "write") as (proc, d):
+                with patch.object(cc, "group_commands") as group_commands:
+                    self.assertIn('status="cancelled"', self.control("cancel", d.name, "--wait", "5"))
+                    group_commands.assert_not_called()
+                output, _ = proc.communicate(timeout=5)
+                self.assertEqual(proc.returncode, 2, output)
+                self.assertFalse((d / "events.jsonl").exists())
+                self.assertFalse(cc.clone_root(self.project).exists())
+                self.assertEqual(json.loads((d / "result.json").read_text())["reason"], "cancelled_by_user")
+
+    def test_shadow_bypasses_full_pools_and_redispatch(self):
+        self.commit_fixture()
+        self.worker("agy", "sys.stdin.read()\nsys.exit(3)")
+        self.worker("codex", "sys.stdin.read()\nprint(json.dumps(" + repr(ANSWER) + "))")
+        with patch.dict(os.environ, CC_DELEGATE_MAX_READERS="1", CC_DELEGATE_MAX_WRITERS="1",
+                        CC_DELEGATE_SLOT_WAIT="0", CC_DELEGATE_AGY_FALLBACK="1"), contextlib.ExitStack() as held:
+            self.hold_slot(held, "ro")
+            self.hold_slot(held, "write")
+            d, read = self.run_task("--shadow", "--fallback", worker="agy", expected=2)
+            self.assertEqual((read["worker"], read["reason"]), ("agy", "worker_failed"))
+            self.assertIs(json.loads((d / "meta.json").read_text())["shadow"], True)
+            _, write = self.run_task("--shadow", "--mode", "write")
+        log = list(cc.records(cc.home() / "delegate-log.jsonl"))
+        self.assertEqual([(row["task_id"], row["shadow"]) for row in log],
+                         [(read["task_id"], True), (write["task_id"], True)])
+
+    def test_onto_branch_conflict_never_queues(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "feature")
+        with patch.dict(os.environ, CC_DELEGATE_MAX_WRITERS="1", CC_DELEGATE_SLOT_WAIT="0.25"), \
+                contextlib.ExitStack() as held:
+            self.hold_slot(held, "write", "feature", shadow=True)
+            self.hold_slot(held, "write")
+            for flags in ([], ["--shadow"]):
+                _, result = self.run_task("--mode", "write", "--onto", "feature", *flags, expected=1)
+                self.assertEqual(result["reason"], "onto_branch_busy")
+                self.assertNotIn('status="queued"', self.receipt)
+            self.assertFalse(cc.clone_root(self.project).exists())
 
     def test_breaches_ignore_only_sibling_landings(self):
         state = lambda head, refs, branch="refs/heads/feature": {

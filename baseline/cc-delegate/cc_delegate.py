@@ -46,6 +46,7 @@ LOOP_REPEATS = 3
 # network bytes. Counting requests misfired: a subagent's normal, rapid requests are
 # not step events in the parent stream.
 AGY_STALL_SECONDS = 600
+SLOT_WAIT_SECONDS = 30 * 60
 AGY_WINDOWS = {f"gemini-3.8-flash-{level}": 1_048_576
                for level in ("low", "medium", "high")}
 HEADER = ("这是 {sender} 的任务转交。只读模式下不写文件。禁止读取 .env、密钥或凭据文件，"
@@ -2250,21 +2251,52 @@ def env_limit(name, default):
     return value if value > 0 else default
 
 
-def slot(stack, project, common, mode, onto=None):
-    """Per-repository task slots. Writers each get a private clone, so several may run at once;
-    only one may target a given --onto branch, because the second could never fast-forward."""
-    key = hashlib.sha256(os.fsencode(common or project)).hexdigest()[:24]
-    pool = home() / "delegate-runs" / ".locks"
-    pool.mkdir(exist_ok=True)
-    if mode == "write":
-        if onto:
-            branch_key = hashlib.sha256(onto.encode()).hexdigest()[:16]
-            if not lock(stack, common / f"cc-delegate-onto-{branch_key}.lock"):
+def slot(stack, d, meta, project, common, onto=None):
+    writing = meta["mode"] == "write"
+    limit = (env_limit("CC_DELEGATE_MAX_WRITERS", 4) if writing
+             else env_limit("CC_DELEGATE_MAX_READERS", 0))
+    slots = range(0 if meta["shadow"] else limit)
+    if slots:
+        key = hashlib.sha256(os.fsencode(common or project)).hexdigest()[:24]
+        pool = home() / "delegate-runs" / ".locks"
+        pool.mkdir(exist_ok=True)
+        prefix = f"{key}-w" if writing else f"{key}-"
+    branch_lock = None
+    if onto:
+        branch_key = hashlib.sha256(onto.encode()).hexdigest()[:16]
+        branch_lock = common / f"cc-delegate-onto-{branch_key}.lock"
+    try:
+        wait = nonnegative(os.getenv("CC_DELEGATE_SLOT_WAIT", str(SLOT_WAIT_SECONDS)))
+    except (ValueError, argparse.ArgumentTypeError):
+        wait = SLOT_WAIT_SECONDS
+    busy = "repository_writers_busy" if writing else "repository_readers_busy"
+    deadline = None
+    cancelled = d / "cancel.requested"
+    while True:
+        if cancelled.exists():
+            raise Blocked("cancelled_by_user")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise Blocked(busy)
+        # Don't reserve a branch while waiting for a repository slot.
+        with ExitStack() as attempt:
+            if branch_lock and not lock(attempt, branch_lock):
                 raise Blocked("onto_branch_busy")
-        if not any(lock(stack, pool / f"{key}-w{i}") for i in range(env_limit("CC_DELEGATE_MAX_WRITERS", 4))):
-            raise Blocked("repository_writers_busy")
-    elif not any(lock(stack, pool / f"{key}-{i}") for i in range(env_limit("CC_DELEGATE_MAX_READERS", 3))):
-        raise Blocked("repository_readers_busy")
+            if not slots or any(lock(attempt, pool / f"{prefix}{i}") for i in slots):
+                if cancelled.exists():
+                    raise Blocked("cancelled_by_user")
+                stack.enter_context(attempt.pop_all())
+                if deadline is not None:
+                    meta["status"] = "running"
+                    save_json(d / "meta.json", meta)
+                return
+        if not wait:
+            raise Blocked(busy)
+        if deadline is None:
+            deadline = time.monotonic() + wait
+            meta["status"] = "queued"
+            save_json(d / "meta.json", meta)
+            print(f'task_id={dumps(meta["task_id"])} status="queued"', flush=True)
+        time.sleep(min(.1, max(0, deadline - time.monotonic())))
 
 
 # Siblings record fetches and fast-forwards so isolation checks can explain those ref moves.
@@ -2481,7 +2513,7 @@ def land(repo, common, meta, reply, new):
 
 LOG_FIELDS = ("task_id", "caller", "worker", "model", "context", "package_tokens_est", "mode", "status",
               "duration_s", "worker_usage", "cc_cost_before", "cc_cost_after", "outcome", "note",
-              "loop_warning", "fallback_from")
+              "loop_warning", "fallback_from", "shadow")
 
 
 def append_log(data, event):
@@ -2584,6 +2616,8 @@ def worker_attempt(driver, args, cwd, d, writable, repo, prompt, meta, finish):
         save_json(d / "meta.json", meta)
         if args.dry_run:
             return None
+        if (d / "cancel.requested").exists():
+            raise Blocked("cancelled_by_user")
         if driver.backend == "sdk":
             # Other invocations need an unambiguous handle before the first approval or idle turn.
             print(f'task_id={dumps(meta["task_id"])} status="starting" backend="sdk"', flush=True)
@@ -2646,7 +2680,8 @@ def run(args, driver, quiet=False):
     meta = dict(fallback_from=getattr(args, "fallback_from", None),
                 fallback_reason=getattr(args, "fallback_reason", None), task_id=task_id,
                 attempt_id=secrets.token_hex(8), caller=args.caller, worker=args.to, model=args.model,
-                context=tier, effective_context=tier, mode=args.mode, dry_run=args.dry_run, project_dir=str(project),
+                context=tier, effective_context=tier, mode=args.mode, dry_run=args.dry_run, shadow=args.shadow,
+                project_dir=str(project),
                 run_dir=str(d), worker_session_id=None, worker_usage=None, base_sha=None,
                 changed_files=[], diff_stat=[], worktree=None, verification=[], status="running",
                 started_at=now(), duration_s=None, cc_session=None, cc_cost_before=None,
@@ -2715,6 +2750,16 @@ def run(args, driver, quiet=False):
             cwd = project
             if repo:
                 common = Path(git(project, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n"))
+            if not files_mode and args.mode == "write":
+                if not repo:
+                    raise Blocked("write_requires_git_head")
+                if args.onto and args.base:
+                    raise Blocked("onto_and_base_conflict")
+                if args.onto in PROTECTED_BRANCHES:
+                    raise Blocked("onto_protected_branch")
+            if not files_mode and not args.dry_run:
+                slot(stack, d, meta, project, common, args.onto)
+            if repo:
                 meta["base_sha"] = git(project, "rev-parse", "--verify", "HEAD", check=False).strip() or None
             writable = ()
             if isinstance(driver, ClaudePrint):
@@ -2733,13 +2778,9 @@ def run(args, driver, quiet=False):
                     scratch.mkdir(mode=0o700)
                     meta["worktree"] = str(cwd)
             elif args.mode == "write":
-                if not repo or not meta["base_sha"]:
+                if not meta["base_sha"]:
                     raise Blocked("write_requires_git_head")
                 if args.onto:
-                    if args.base:
-                        raise Blocked("onto_and_base_conflict")
-                    if args.onto in PROTECTED_BRANCHES:
-                        raise Blocked("onto_protected_branch")
                     args.base = "refs/heads/" + args.onto
                     if not git(project, "rev-parse", "--verify", "-q", args.base, check=False).strip():
                         raise Blocked("unknown_onto_branch")
@@ -2761,9 +2802,7 @@ def run(args, driver, quiet=False):
                 cwd = area / task_id
                 gitdir, scratch = area / f".git-{task_id}", area / f".tmp-{task_id}"
                 writable = (gitdir, scratch)
-            if not files_mode and not args.dry_run:
-                slot(stack, project, common, args.mode, args.onto)
-                if args.mode == "write":
+                if not args.dry_run:
                     with ExitStack() as publish:
                         # Never snapshot halfway through a sibling task's fetch or landing.
                         lock(publish, common / "cc-delegate-publish.lock", blocking=True)
@@ -2915,7 +2954,7 @@ def resolve_backend(to, mode, explicit, caller="claude"):
 
 def run_with_fallback(args, driver):
     """Redispatch is a new, separately accounted task, with its own checkout and session."""
-    if not driver.redispatch or not args.fallback or args.dry_run:
+    if not driver.redispatch or not args.fallback or args.dry_run or args.shadow:
         return run(args, driver)
     # run() fills in derived fields such as args.base from --onto; the retry must start from
     # what the caller asked for, or --onto plus the derived --base blocks it.
@@ -3064,6 +3103,12 @@ def cancel(d, seconds):
         (d / "cancel.requested").touch()
         control_log(d, "cancel", "requested")
         meta = json.loads((d / "meta.json").read_text())
+    if not meta.get("worker_pgid"):
+        if wait_result(result, seconds):
+            receipt(json.loads(result.read_text()))
+        else:
+            print(f'task_id={dumps(d.name)} status="cancelling"')
+        return
     driver = recorded_driver(meta)
     driver.interrupt(d)
     for sig, delay in ((signal.SIGINT, seconds), (signal.SIGTERM, INT_GRACE), (signal.SIGKILL, 5)):
@@ -3144,8 +3189,11 @@ def running_status(d, meta):
     elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(meta["started_at"])
     driver = recorded_driver(meta)
     backend = driver.backend or meta["worker"]
-    print(f'task_id={d.name} status="running" elapsed_s={max(0, int(elapsed.total_seconds()))}'
+    status = "queued" if meta.get("status") == "queued" else "running"
+    print(f'task_id={d.name} status={dumps(status)} elapsed_s={max(0, int(elapsed.total_seconds()))}'
           f' backend={dumps(backend)} mode={dumps(meta["mode"])} caller={dumps(meta.get("caller", "claude"))}')
+    if status == "queued":
+        return
     command = message = code = None
     for event in driver.status_events(d / "events.jsonl"):
         if command is None and event.command is not None:
@@ -3455,6 +3503,7 @@ def main(argv=None):
     r.add_argument("--stall-seconds", type=positive,
                    help=f"seconds with all activity signals silent (agy default: {AGY_STALL_SECONDS} seconds)")
     r.add_argument("--dry-run", action="store_true")
+    r.add_argument("--shadow", action="store_true", help="skip repository slots and disable redispatch")
     fallback = r.add_mutually_exclusive_group()
     fallback.add_argument("--fallback", action="store_true",
                           help="retry agy failures on Codex (also set by CC_DELEGATE_AGY_FALLBACK=1)")
