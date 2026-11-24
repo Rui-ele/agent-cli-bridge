@@ -32,6 +32,7 @@ import stat
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 
 RESERVE_RATIO = 0.5
@@ -1879,6 +1880,28 @@ def run_interrupts():
         yield finish
 
 
+@contextmanager
+def defer_interrupts():
+    # Publish ownership of a new process or directory before handling an interrupt.
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending = None
+
+    def defer(signum, frame):
+        nonlocal pending
+        pending = pending or signum
+
+    try:
+        with ExitStack() as restore:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                restore.callback(signal.signal, sig, signal.signal(sig, defer))
+            yield
+    finally:
+        if pending is not None:
+            signal.raise_signal(pending)
+
+
 if hasattr(os, "waitid"):
     waitid = os.waitid
 else:
@@ -2015,23 +2038,26 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None, 
             else:
                 log.write(dumps({"stream": channel, "text": value}) + "\n")
 
-        try:
-            proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, start_new_session=True, bufsize=0, env=env,
-                                    pass_fds=pass_fds)
-        except OSError as error:
-            raise WorkerLaunchError(str(error)) from error
-        last_activity = last_scan = time.monotonic()
+        proc = None
         stalled = False
-        activity_log = run_dir / events.driver.activity_log if events.driver.activity_log else None
-        log_offset = 0
         net = None
-        if not events.driver.reports_agent_pid:
-            monitor_pid = proc.pid
-        meta["liveness"] = "output+files"
         try:
-            # start_new_session makes the child's PID its process group ID.
-            meta.update(worker_pid=proc.pid, worker_pgid=proc.pid)
+            check_cancel(run_dir)
+            with defer_interrupts():
+                try:
+                    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE, start_new_session=True, bufsize=0, env=env,
+                                            pass_fds=pass_fds)
+                except OSError as error:
+                    raise WorkerLaunchError(str(error)) from error
+                # start_new_session makes the child's PID its process group ID.
+                meta.update(worker_pid=proc.pid, worker_pgid=proc.pid)
+            last_activity = last_scan = time.monotonic()
+            activity_log = run_dir / events.driver.activity_log if events.driver.activity_log else None
+            log_offset = 0
+            if not events.driver.reports_agent_pid:
+                monitor_pid = proc.pid
+            meta["liveness"] = "output+files"
             save_json(run_dir / "meta.json", meta)
             with ExitStack() as io_stack:
                 sel = io_stack.enter_context(selectors.DefaultSelector())
@@ -2153,7 +2179,7 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None, 
             return proc.wait(), stalled
         except BaseException:
             finish()
-            if proc.returncode is None:
+            if proc is not None and proc.returncode is None:
                 meta["group_cleanup_confirmed"] = stop_group(proc)
             raise
         finally:
@@ -2161,15 +2187,17 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None, 
                 net[0].kill()
                 net[0].wait()
                 os.close(net[1])
-            for pipe in (proc.stdin, proc.stdout, proc.stderr):
-                pipe.close()
+            if proc is not None:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    pipe.close()
             for channel, fragment in pending.items():
                 if fragment:
                     line_received(channel, fragment)
             if stalled:
                 log.write(dumps({"type": "stalled", "stall_seconds": stall,
                                  "stall_reason": meta.get("stall_reason")}) + "\n")
-            meta.update(worker_session_id=events.session, worker_usage=events.usage, exit_code=proc.returncode)
+            if proc is not None:
+                meta.update(worker_session_id=events.session, worker_usage=events.usage, exit_code=proc.returncode)
 
 
 def raw_stdout(run_dir):
@@ -2192,16 +2220,20 @@ def raw_stdout(run_dir):
 def git(cwd, *argv, check=True, env=None, inspect_clone=False):
     timeout = env_limit("CC_DELEGATE_GIT_TIMEOUT", 60) if inspect_clone else None
     cmd = ["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *argv]
-    with subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, env=env) as p:
+    with ExitStack() as child:
+        p = None
         try:
+            with defer_interrupts():
+                p = child.enter_context(subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                         stderr=subprocess.PIPE, start_new_session=True, env=env))
             stdout, _ = p.communicate(timeout=timeout)
         except BaseException as error:
             # A fetch may leave upload-pack blocked on the same clone metadata.
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            if p is not None:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             if isinstance(error, subprocess.TimeoutExpired):
                 raise CloneInspectionTimeout("clone_inspection_timeout") from error
             raise
@@ -2482,13 +2514,16 @@ def write_base(project, repo, args):
     head = git(project, "rev-parse", "--verify", "HEAD", check=False).strip() if repo else None
     if not head:
         raise Blocked("write_requires_git_head")
-    if args.onto:
+    if args.onto is not None:
         if args.base:
             raise Blocked("onto_and_base_conflict")
         if args.onto in PROTECTED_BRANCHES:
             raise Blocked("onto_protected_branch")
+        # check-ref-format expands @{-n}; the lock and landing must use a literal name.
+        if git(project, "check-ref-format", "--branch", args.onto, check=False) != args.onto + "\n":
+            raise Blocked("unknown_onto_branch")
         ref = "refs/heads/" + args.onto
-        base = git(project, "rev-parse", "--verify", "-q", ref + "^{commit}", check=False).strip()
+        base = git(project, "show-ref", "--verify", "--hash", ref, check=False).strip()
         if not base:
             raise Blocked("unknown_onto_branch")
         if checked_out_elsewhere(repo, args.onto):
@@ -2717,6 +2752,7 @@ def run(args, driver, quiet=False):
         meta.update(workspace="files", workspace_phase="running")
     driver = select_driver(args, driver, meta)
     worktree = events = None
+    staged_dirs = ()
     reply = dict(summary=[], uncertainties=[], report_markdown="")
     with ExitStack() as stack:
         finish = stack.enter_context(run_interrupts())
@@ -2795,6 +2831,8 @@ def run(args, driver, quiet=False):
                 args.source_paths = (project,)
                 cwd, scratch = d / "work", d / "scratch"
                 writable = (scratch,)
+                if not args.dry_run:
+                    staged_dirs = (cwd, d / "base", scratch)
                 check_cancel(d)
                 try:
                     file_workspace.prepare(project, d, sensitive, dry_run=args.dry_run)
@@ -2817,12 +2855,17 @@ def run(args, driver, quiet=False):
                         watch_from = time.time()
                         before = checkout_state(Path(repo))
                     check_cancel(d)
+                    area.mkdir(exist_ok=True)
+                    paths = (cwd, gitdir, scratch)
+                    if area.is_symlink() or any(path.exists() or path.is_symlink() for path in paths):
+                        raise Blocked("unsafe_clone_path")
+                    with defer_interrupts():
+                        scratch.mkdir()
+                        staged_dirs = paths
                     if driver.backend == "sdk":
                         # Recovery needs the clone path even if checkout stops halfway.
                         meta["worktree"] = str(cwd)
                         save_json(d / "meta.json", meta)
-                    area.mkdir(exist_ok=True)
-                    scratch.mkdir()
                     isolated_checkout(Path(repo), cwd, gitdir, f"delegate/{task_id}", meta["base_sha"])
                     worktree = cwd
                     meta["worktree"] = str(cwd)
@@ -2858,7 +2901,7 @@ def run(args, driver, quiet=False):
                 status = "blocked"
             elif isinstance(error, WorkerLaunchError):
                 status = "failed"
-            elif isinstance(error, KeyboardInterrupt) and meta["status"] == "queued":
+            elif isinstance(error, KeyboardInterrupt) and "worker_pid" not in meta:
                 status = "cancelled"
             elif isinstance(error, KeyboardInterrupt) or worktree or (d / "events.jsonl").exists():
                 status = "outcome_unknown"
@@ -2878,7 +2921,10 @@ def run(args, driver, quiet=False):
         with ExitStack() as publish:
             publish_error = None
             diff_path = None
-            if files_mode:
+            cancel_request = d / "cancel.requested"
+            worker_started = "worker_pid" in meta
+            prelaunch_cancelled = not worker_started and (meta["status"] == "cancelled" or cancel_request.exists())
+            if files_mode and not prelaunch_cancelled:
                 if meta["worktree"]:
                     try:
                         changes, diff_path = file_workspace.compare(d, sensitive,
@@ -2887,7 +2933,7 @@ def run(args, driver, quiet=False):
                         meta.update(file_changes=changes, changed_files=paths)
                     except (OSError, ValueError) as error:
                         publish_error = error
-            elif worktree:
+            elif worktree and not prelaunch_cancelled:
                 try:
                     # Sibling write tasks fetch and land into the same repository; one at a time.
                     lock(publish, common / "cc-delegate-publish.lock", blocking=True)
@@ -2913,11 +2959,22 @@ def run(args, driver, quiet=False):
                     publish_error = error
             # Accept cancellation during fetch, then serialize the landing decision with result publication.
             lock(stack, d / ".result.lock", blocking=True)
-            cancelled = (d / "cancel.requested").exists()
+            cancelled = meta["status"] == "cancelled" or cancel_request.exists()
             if cancelled:
                 meta.update(status="cancelled", reason="cancelled_by_user")
                 reply["summary"] = ["cancelled_by_user"]
                 reply["uncertainties"] = [u for u in reply["uncertainties"] if u != "worker_failed"]
+                if not worker_started:
+                    worktree = meta["worktree"] = None
+                    for path in staged_dirs:
+                        try:
+                            shutil.rmtree(path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            meta["worktree"] = str(staged_dirs[0])
+                    if meta["worktree"]:
+                        reply["uncertainties"].append("workspace_cleanup_failed")
             if worktree and meta.get("onto") and publish_error is None:
                 try:
                     land(Path(repo), common, meta, reply, new)

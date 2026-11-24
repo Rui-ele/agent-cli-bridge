@@ -741,10 +741,10 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
         cc.slot(stack, d, meta, self.project, self.project / ".git")
 
     @contextlib.contextmanager
-    def queued_task(self, *args, worker="codex"):
-        cmd = [sys.executable, str(SCRIPT), "run", "--to", worker, "--model", "synthetic",
+    def queued_task(self, *args, worker="codex", launcher=(str(SCRIPT),)):
+        cmd = [sys.executable, *launcher, "run", "--to", worker, "--model", "synthetic",
                "--cc-session", str(self.session), "--project-dir", str(self.project), "--task", "x", *args]
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+        with subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
             try:
                 deadline = time.monotonic() + 5
                 while proc.poll() is None and time.monotonic() < deadline:
@@ -888,6 +888,65 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
             log = list(cc.records(cc.home() / "delegate-log.jsonl"))
             self.assertEqual([(row["worker"], row["status"]) for row in log], [("agy", "cancelled")] * 2)
 
+    def test_signal_while_waiting_for_publish_lock_after_admission_cancels(self):
+        self.commit_fixture()
+        ready = self.root / "waiting_for_publish"
+        launcher = ("-c", """
+import sys
+from pathlib import Path
+import cc_delegate as cc
+
+ready = Path(sys.argv.pop(1))
+lock = cc.lock
+
+def notify_publish_lock(stack, path, blocking=False, **kwargs):
+    if blocking and path.name == 'cc-delegate-publish.lock':
+        assert not lock(stack, path)
+        ready.touch()
+    return lock(stack, path, blocking, **kwargs)
+
+cc.lock = notify_publish_lock
+sys.exit(cc.main())
+""", str(ready))
+        with patch.dict(os.environ, CC_DELEGATE_MAX_WRITERS="1", CC_DELEGATE_SLOT_WAIT="10"), \
+                contextlib.ExitStack() as publish, contextlib.ExitStack() as held:
+            self.assertTrue(cc.lock(publish, self.project / ".git/cc-delegate-publish.lock"))
+            self.hold_slot(held, "write")
+            with self.queued_task("--mode", "write", "--backend", "exec", "--fallback", worker="agy",
+                                  launcher=launcher) as (proc, d):
+                held.close()
+                deadline = time.monotonic() + 5
+                while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(ready.exists())
+                meta = json.loads((d / "meta.json").read_text())
+                self.assertEqual(meta["status"], "running")
+                self.assertNotIn("worker_pid", meta)
+                proc.send_signal(signal.SIGTERM)
+                output, _ = proc.communicate(timeout=5)
+                self.assertEqual(proc.returncode, 2, output)
+                self.assertFalse((d / "events.jsonl").exists())
+                result = json.loads((d / "result.json").read_text())
+                self.assertEqual((result["status"], result["reason"]), ("cancelled", "cancelled_by_user"))
+                self.assertFalse(cc.clone_root(self.project).exists())
+        log = list(cc.records(cc.home() / "delegate-log.jsonl"))
+        self.assertEqual([(row["worker"], row["status"]) for row in log], [("agy", "cancelled")])
+
+    def test_signal_during_checkout_removes_partial_clone(self):
+        self.commit_fixture()
+
+        def interrupt_checkout(repo, cwd, gitdir, branch, base):
+            cwd.mkdir()
+            gitdir.mkdir()
+            signal.raise_signal(signal.SIGINT)
+
+        with patch.object(cc, "isolated_checkout", side_effect=interrupt_checkout):
+            d, result = self.run_task("--mode", "write", expected=2)
+        self.assertEqual((result["status"], result["reason"]), ("cancelled", "cancelled_by_user"))
+        self.assertIsNone(result["worktree"])
+        self.assertFalse((d / "events.jsonl").exists())
+        self.assertEqual(list(cc.clone_root(self.project).iterdir()), [])
+
     def test_shadow_reader_bypasses_full_pool_and_environment_redispatch(self):
         self.commit_fixture()
         self.worker("agy", "sys.stdin.read()\nsys.exit(3)")
@@ -953,6 +1012,12 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
             check("unknown_onto_branch", "--onto", "missing")
             check("unknown_base_ref", "--base", "missing")
             cc.git(self.project, "branch", "feature")
+            cc.git(self.project, "tag", "tag-only")
+            cc.git(self.project, "checkout", "-q", "feature")
+            cc.git(self.project, "checkout", "-q", "main")
+            for invalid in ("feature~0", "@{-1}", "tag-only", ""):
+                with self.subTest(onto=invalid):
+                    check("unknown_onto_branch", "--onto", invalid)
             cc.git(self.project, "worktree", "add", "-q", str(self.root / "other"), "feature")
             check("onto_checked_out_elsewhere", "--onto", "feature")
             cc.git(self.project, "worktree", "remove", str(self.root / "other"))

@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -122,6 +123,20 @@ class FilesCLI(unittest.TestCase):
         self.assertEqual(result["workspace_phase"], "failed")
         self.assert_terminal(d, "failed")
         self.assertFalse((self.project / "draft").exists())
+
+    def test_interrupt_during_staging_removes_partial_copies(self):
+        import file_workspace
+
+        def interrupt_prepare(project, d, sensitive, *, dry_run):
+            (d / "base").mkdir()
+            (d / "work").mkdir()
+            signal.raise_signal(signal.SIGTERM)
+
+        with patch.object(file_workspace, "prepare", interrupt_prepare):
+            d, result = self.run_task("--mode", "write", "--workspace", "files", expected=2)
+        self.assertEqual((result["status"], result["reason"]), ("cancelled", "cancelled_by_user"))
+        self.assertFalse((d / "base").exists() or (d / "work").exists())
+        self.assert_terminal(d, "failed")
 
     def test_legacy_pending_and_started_transactions(self):
         for status, phase in (("ok", "no_changes"), ("outcome_unknown", "failed")):
