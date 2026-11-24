@@ -51,3 +51,4 @@
 - 已知遗留四条和 ACP 记账问题已修：任务期间又改了原本就有改动的文件，现在能检测到（只比文件大小和修改时间）；其他 `delegate/*` 分支被改动会报越界（并行任务的正常落地不算）；没有新提交时不再取回空分支；只读模式下给 `--base` 或 `--onto` 会直接报错；ACP 的 `total_tokens` 改为输入加输出，和 `agy -p` 一致。已装回。
 - 第 6 项：Mac mini 上装好并实测通过（Codex、agy、claude 各一次只读调用，agy 一次写入任务；沙箱照样拦住越界写入）。在那台机器上通过 SSH 使用时，macOS 钥匙串是锁着的：claude 改用 `CLAUDE_CODE_OAUTH_TOKEN` 长期令牌，agy 在 SSH 会话里登录，凭据会存进它自己的文件存储。
 - `--effort` 增加 `max` 和 `ultra`：本机 Codex 的模型缓存显示 `gpt-6.2-astra` 支持这两档，`ultra` 会自动拆子代理；Codex 不写 `--effort` 时默认是 `low`。其他接单方不支持的档位由它们自己的 CLI 拒绝。
+- 反方向的第一步：Codex 可以作为发起方（`--caller codex`），委托给 Claude Code 或 agy；Codex 委托 Claude 时默认走官方 Agent SDK（`--backend sdk`，支持插话、排队、中断、逐项审批、保持会话）。经三轮 Astra 审阅（含 Sol、Neon 影子），修了 SDK 生命周期、Codex 历史读取、宿主侧 git 读取克隆配置、Seatbelt 写入范围等问题。agy 作为发起方还没做。
