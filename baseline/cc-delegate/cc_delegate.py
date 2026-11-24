@@ -1148,15 +1148,6 @@ class Driver:
         env = dict(os.environ, CC_DELEGATE_DEPTH=str(delegation_depth() + 1))
         if writable:
             env["TMPDIR"] = str(writable[-1])
-        if workspace == "files" and self.executable in ("agy", "claude"):
-            # Keep CLI state writable without opening the caller's home or shared temp.
-            scratch = writable[-1]
-            env["HOME"] = str(scratch)
-            for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
-                        "XDG_RUNTIME_DIR"):
-                env.pop(key, None)
-            if self.executable == "claude":
-                env["CLAUDE_CONFIG_DIR"] = str(scratch / ".claude")
         return env
 
     def encode_prompt(self, prompt):
@@ -1333,6 +1324,13 @@ class AgyDriver(Driver):
     def window(self, model):
         return AGY_WINDOWS.get(model, 200_000), True
 
+    def profile_text(self, args, cwd, run_dir, writable):
+        files = getattr(args, "workspace", None) == "files"
+        rules = seatbelt_profile(args.mode, cwd, writable, ["~/.gemini"], shared_temp=not files)
+        if files:
+            rules += protect_run_and_source(run_dir, args.source_paths, (cwd, *writable))
+        return rules
+
 
 def included_dirs(cwd, includes):
     root = Path(cwd).resolve()
@@ -1361,7 +1359,7 @@ class AgyPrint(AgyDriver):
             if not seatbelt_available():
                 raise Blocked("os_sandbox_unavailable")
             profile = run_dir / "sandbox.sb"
-            save_text(profile, files_seatbelt_profile(cwd, writable))
+            save_text(profile, self.profile_text(args, cwd, run_dir, writable))
             cmd = [str(SEATBELT), "-f", str(profile), *cmd]
         elif args.mode == "write":
             cmd.append("--sandbox")
@@ -1436,8 +1434,20 @@ def seatbelt_available():
     return sys.platform == "darwin" and SEATBELT.is_file() and os.access(SEATBELT, os.X_OK)
 
 
-def files_seatbelt_profile(cwd, writable):
-    return seatbelt_profile("write", cwd, writable, (), shared_temp=False)
+def protect_run_and_source(run_dir, sources, writable_in_run):
+    protected = [home() / "delegate-log.jsonl"]
+    rules = ""
+    if writable_in_run:
+        # Protect all receipts even when the run home overlaps a writable CLI state directory.
+        roots = [dumps(str(root.resolve())) for root in writable_in_run]
+        exceptions = " ".join(f"(require-not (subpath {root}))" for root in roots)
+        rules += f"(deny file-write* (require-all (subpath {dumps(str(run_dir.parent.resolve()))}) {exceptions}))\n"
+        rules += "".join(f"(deny file-write* (literal {root}))\n" for root in roots)
+    else:
+        protected.append(run_dir.parent)
+    for root in [*protected, *sources]:
+        rules += f"(deny file-write* (subpath {dumps(str(root.resolve()))}))\n"
+    return rules
 
 
 class SeatbeltDriver(Driver):
@@ -1453,9 +1463,7 @@ class AgyAcp(SeatbeltDriver, AgyDriver, ItemEventDriver):
 
     def command(self, args, cwd, run_dir, writable):
         profile = run_dir / "sandbox.sb"
-        rules = (files_seatbelt_profile(cwd, writable) if getattr(args, "workspace", None) == "files"
-                 else seatbelt_profile(args.mode, cwd, writable, ["~/.gemini"]))
-        save_text(profile, rules)
+        save_text(profile, self.profile_text(args, cwd, run_dir, writable))
         cmd = [sys.executable, str(Path(__file__).resolve()), "acp-worker",
                "--cwd", str(cwd), "--mode", args.mode, "--agent-mode",
                "plan" if args.mode == "ro" else "accept-edits", "--model", args.model,
@@ -1495,8 +1503,6 @@ class ClaudePrint(SeatbeltDriver):
         return env
 
     def profile_text(self, args, cwd, run_dir, writable):
-        if getattr(args, "workspace", None) == "files":
-            return files_seatbelt_profile(cwd, writable)
         config = Path(cwd) / Path(os.getenv("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
         dirs = [config / name for name in self.state_dirs]
         dirs.append(config / "projects" / claude_project_name(cwd))
@@ -1508,19 +1514,10 @@ class ClaudePrint(SeatbeltDriver):
         # Claude needs its shared user state and the sibling files used for atomic updates.
         patterns = ["^" + home_pattern + r"/\.claude\.json(\.[^/]*)?$"]
         rules = seatbelt_profile(args.mode, cwd, writable, dirs, patterns, shared_temp=False)
-        protected = [home() / "delegate-log.jsonl"]
-        if args.mode == "ro" and writable:
-            scratch = dumps(str(writable[-1]))
-            # Keep every receipt and directory entry protected, including the scratch root itself.
-            rules += (f"(deny file-write* (require-all (subpath {dumps(str(run_dir.parent))}) "
-                      f"(require-not (subpath {scratch}))))\n"
-                      f"(deny file-write* (literal {scratch}))\n")
-        else:
-            protected.append(run_dir.parent)
-        protected.extend(getattr(args, "source_paths", ()))
-        for root in protected:
-            rules += f"(deny file-write* (subpath {dumps(str(root.resolve()))}))\n"
-        return rules
+        writable_in_run = (cwd, *writable) if getattr(args, "workspace", None) == "files" else ()
+        if args.mode == "ro":
+            writable_in_run = writable
+        return rules + protect_run_and_source(run_dir, getattr(args, "source_paths", ()), writable_in_run)
 
     def command(self, args, cwd, run_dir, writable):
         profile = run_dir / "sandbox.sb"
@@ -2500,6 +2497,24 @@ def exit_status(status):
     return {"ok": 0, "partial": 0, "dry_run": 0, "outcome_unknown": 2, "stalled": 2, "cancelled": 2}.get(status, 1)
 
 
+def completed_files_phase(meta):
+    if meta["status"] == "dry_run":
+        return "unavailable"
+    if meta["status"] not in ("ok", "partial"):
+        return "failed"
+    return "pending_apply" if meta["changed_files"] else "no_changes"
+
+
+def recorded_files_phase(d, meta):
+    import file_transaction
+
+    phase = meta["workspace_phase"]
+    if phase in ("pending_apply", "unavailable"):
+        # Older receipts classified the snapshot before checking the final worker outcome.
+        phase = completed_files_phase(meta)
+    return file_transaction.phase(d, phase)
+
+
 def receipt(data):
     def clean(value):
         if isinstance(value, str):
@@ -2810,14 +2825,14 @@ def run(args, driver, quiet=False):
             reply["uncertainties"].append("group_cleanup_unconfirmed")
         with ExitStack() as publish:
             publish_error = None
+            diff_path = None
             if files_mode:
-                meta["workspace_phase"] = "unavailable"
                 if meta["worktree"]:
                     try:
                         changes, diff_path = file_workspace.compare(d, sensitive,
                                                                     report_prefix=reply["report_markdown"])
                         paths = sorted(path for group in changes.values() for path in group)
-                        meta.update(file_changes=changes, changed_files=paths, workspace_phase="pending_apply")
+                        meta.update(file_changes=changes, changed_files=paths)
                     except (OSError, ValueError) as error:
                         publish_error = error
             elif worktree:
@@ -2867,7 +2882,9 @@ def run(args, driver, quiet=False):
             meta.update(events.driver.receipt_fields(meta, events))
             if files_mode:
                 meta.pop("resume_command", None)
-        if meta.get("workspace_phase") == "pending_apply":
+        if files_mode:
+            meta["workspace_phase"] = completed_files_phase(meta)
+        if diff_path is not None:
             os.replace(diff_path, d / "report.md")
         else:
             save_text(d / "report.md", reply["report_markdown"])
@@ -3161,12 +3178,14 @@ def existing(args):
         finished = result.is_file()
         data = json.loads((result if finished else d / "meta.json").read_text())
         if data.get("workspace") == "files":
+            data["workspace_phase"] = recorded_files_phase(d, data)
+        if args.command in ("apply", "rollback"):
             import file_transaction
 
-            data["workspace_phase"] = file_transaction.phase(d, data["workspace_phase"])
-        if args.command in ("apply", "rollback"):
             if data.get("workspace") != "files":
                 raise Blocked("requires_files_workspace")
+            if data["workspace_phase"] in ("failed", "no_changes"):
+                raise Blocked("files_workspace_" + data["workspace_phase"])
             if data["workspace_phase"] in ("unavailable", "running"):
                 raise Blocked("files_workspace_not_ready")
             if data.get("outcome") == "discarded" and data["workspace_phase"] == "pending_apply":
@@ -3318,7 +3337,7 @@ def prune_run(d, cutoff, dry_run, counts, kept, kept_clones, unsafe):
             journal = d / file_transaction.JOURNAL_NAME
             if journal.exists() and journal.stat().st_mtime >= cutoff:
                 return False
-            phase = file_transaction.phase(d, meta["workspace_phase"])
+            phase = recorded_files_phase(d, meta)
             discarded = result.is_file() and json.loads(result.read_text()).get("outcome") == "discarded"
             unfinished = phase == "pending_apply" or (phase in ("running", "unavailable") and (d / "work").exists())
             if phase in ("applying", "rolling_back") or (unfinished and not discarded):

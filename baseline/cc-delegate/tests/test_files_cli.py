@@ -71,6 +71,78 @@ class FilesCLI(unittest.TestCase):
         self.cli("prune", "--older-than", "0")
         self.assertFalse(d.exists())
 
+    def assert_terminal(self, d, phase):
+        self.assertIn(f'workspace_phase="{phase}"', self.cli("status", d.name))
+        self.assertIn("files_workspace_" + phase, self.cli("apply", d.name, expected=1))
+        self.cli("prune")
+        self.assertTrue(d.exists())
+        self.cli("prune", "--older-than", "0")
+        self.assertFalse(d.exists())
+
+    def test_worker_outcome_and_changes_determine_delivery(self):
+        cases = (("ok", False, 0, "no_changes"), ("partial", False, 0, "no_changes"),
+                 ("partial", True, 0, "pending_apply"), ("failed", True, 1, "failed"),
+                 ("blocked", False, 1, "failed"), ("outcome_unknown", False, 2, "failed"))
+        for status, changed, expected_exit, phase in cases:
+            with self.subTest(status=status, changed=changed):
+                reply = dict(fixtures.ANSWER, status=status)
+                script = ["sys.stdin.read()"]
+                if changed:
+                    script.append("Path('draft').write_text('review me')")
+                script.append("sys.exit(1)" if status == "outcome_unknown" else f"print(json.dumps({reply!r}))")
+                self.worker("codex", "\n".join(script))
+                d, result = self.run_task("--mode", "write", "--workspace", "files", expected=expected_exit)
+                self.assertEqual((result["status"], result["workspace_phase"]), (status, phase))
+                if changed:
+                    self.assertIn("+review me", (d / "report.md").read_text())
+                if phase == "pending_apply":
+                    self.cli("apply", d.name)
+                    self.assertEqual((self.project / "draft").read_text(), "review me")
+                    self.cli("rollback", d.name)
+                else:
+                    self.assert_terminal(d, phase)
+                self.assertFalse((self.project / "draft").exists())
+
+    def test_cancellation_during_diff_prevents_apply(self):
+        import file_workspace
+
+        compare = file_workspace.compare
+
+        def cancelled(d, *args, **kwargs):
+            diff = compare(d, *args, **kwargs)
+            (d / "cancel.requested").touch()
+            return diff
+
+        self.worker("codex", "sys.stdin.read()\nPath('draft').touch()\n"
+                    f"print(json.dumps({fixtures.ANSWER!r}))")
+        with patch.object(file_workspace, "compare", cancelled):
+            d, result = self.run_task("--mode", "write", "--workspace", "files", expected=2)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(result["changed_files"], ["draft"])
+        self.assertEqual(result["workspace_phase"], "failed")
+        self.assert_terminal(d, "failed")
+        self.assertFalse((self.project / "draft").exists())
+
+    def test_legacy_pending_and_started_transactions(self):
+        for status, phase in (("ok", "no_changes"), ("outcome_unknown", "failed")):
+            with self.subTest(status=status):
+                self.worker("codex", f"sys.stdin.read()\nprint(json.dumps({fixtures.ANSWER!r}))")
+                d, result = self.run_task("--mode", "write", "--workspace", "files")
+                result.update(status=status, workspace_phase="pending_apply")
+                for name in ("meta.json", "result.json"):
+                    cc.save_json(d / name, result)
+                self.assert_terminal(d, phase)
+
+        d, old = self.edit()
+        self.cli("apply", d.name)
+        # A previous release could have delivered changes even after worker failure.
+        old.update(status="failed", workspace_phase="pending_apply")
+        for name in ("meta.json", "result.json"):
+            cc.save_json(d / name, old)
+        self.assertIn('workspace_phase="applied"', self.cli("status", d.name))
+        self.cli("rollback", d.name)
+        self.assertEqual((self.project / "edit.txt").read_text(), "before\n")
+
     def test_retention_uses_frozen_delivery_and_date_of_apply(self):
         d, _ = self.edit()
         shutil.rmtree(d / "work")

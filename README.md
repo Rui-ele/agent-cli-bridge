@@ -115,7 +115,9 @@ python3 "$delegate" apply TASK_ID
 python3 "$delegate" rollback TASK_ID
 ```
 
-`status` 的 `workspace_phase` 显示运行中（`running`）、待写回（`pending_apply`）、已写回（`applied`）或已回退（`rolled_back`）。`apply` 在目录锁内核对全部受影响路径，发现冲突会列出路径并整批停止。通过后先备份原件，再逐项删除或用同目录临时文件原子替换。`rollback` 同样先检查全部路径，遇到写回后的用户编辑就停止。
+`status` 的 `workspace_phase` 显示交付阶段。任务成功或部分完成时，有文件改动就进入 `pending_apply`，没有改动就进入 `no_changes`。失败或取消的任务进入 `failed`，即使接单方已改动副本。`no_changes` 和 `failed` 都会拒绝 `apply`，并按默认七天规则清理。
+
+`apply` 在目录锁内核对全部受影响路径，发现冲突会列出路径并整批停止。通过后先备份原件，再逐项删除或用同目录临时文件原子替换，完成后显示 `applied`。`rollback` 同样先检查全部路径，遇到写回后的用户编辑就停止，回退完成后显示 `rolled_back`。
 
 原子替换按文件生效。如果写回期间其他应用又修改或锁住文件，前面完成的项目会保留。解除占用、解决冲突后，可重跑同一条 `apply` 或 `rollback` 命令，脚本会根据进度日志继续。原子替换可能丢失 macOS 扩展属性和 Finder 标签。
 
@@ -123,7 +125,7 @@ python3 "$delegate" rollback TASK_ID
 
 第一版按整目录处理普通文件，不接收 `--include`、`--base`、`--onto` 或 `--resume`。Git 仓库及其子目录沿用默认分支交付。空目录和目录权限不单独交付。符号链接、硬链接、特殊文件、嵌套的 `.git` 和命中敏感路径规则的文件会使任务停止。为兼容不同文件系统，路径须使用 UTF-8，不支持仅大小写或 Unicode 规范形式不同的异名，以及文件与目录互换。默认文件数和目录数各最多 10,000，总大小最多 1 GiB，可通过 `CC_DELEGATE_FILES_MAX_COUNT`、`CC_DELEGATE_FILES_MAX_BYTES` 调整。
 
-普通文件夹容易混有私人资料，委托前请核对整个目录的内容。沙箱只限制写入，接单方仍能读取工作区以外的文件。Codex 使用原生工作区沙箱，agy 和 Claude 的两种后端都要求 macOS Seatbelt，并把临时主目录和运行时状态放在任务的 `scratch/`。依赖原主目录状态的登录方式可能需要改用 CLI 支持的环境变量认证。
+普通文件夹容易混有私人资料，委托前请核对整个目录的内容。沙箱只限制写入，接单方仍能读取工作区以外的文件。Codex 使用原生工作区沙箱。agy 和 Claude 的两种后端都要求 macOS Seatbelt，继承调用方的 `HOME` 和 XDG 环境，以便找到已有登录状态。agy 可写 `~/.gemini`，Claude 可写其常用状态目录、当前工作区对应的 `projects` 子目录和 `~/.claude.json` 及其原子更新文件。两者的项目改动和临时文件分别写入任务的 `work/` 与 `scratch/`，原目录、基线和回执受写保护。
 
 ## 默认行为和边界
 

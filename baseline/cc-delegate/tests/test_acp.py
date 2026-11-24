@@ -104,6 +104,14 @@ class AcpCase(unittest.TestCase):
         self.assertIn('command="git status" exit_code=1', out.getvalue())
         self.assertIn("fixture reply", out.getvalue())
 
+    def test_files_session_uses_existing_home(self):
+        state = self.root / ".gemini"
+        state.mkdir()
+        (state / "fixture-marker").touch()
+        with patch.dict(os.environ, ACP_REQUIRE_MARKER="1"):
+            _, meta = self.run_task("--mode", "write", "--workspace", "files")
+        self.assertEqual((meta["worker_session_id"], meta["workspace_phase"]), ("fixture-new", "no_changes"))
+
     def test_total_excludes_cache_and_thought_subcounts(self):
         with patch.dict(os.environ, {"ACP_TOTAL_TOKENS": "18"}):
             _, meta = self.run_task()

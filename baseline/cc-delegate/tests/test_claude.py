@@ -151,6 +151,16 @@ class ClaudeCase(unittest.TestCase):
         self.assertEqual((meta["status"], meta["backend"], meta["context_window"], meta["window_estimated"]),
                          ("ok", "print", 1000000, True))
 
+    def test_files_print_receives_caller_environment(self):
+        with patch.dict(os.environ, XDG_CONFIG_HOME=str(self.home / "xdg")):
+            d, meta = self.run_task("--mode", "write", "--workspace", "files", "--backend", "print")
+        env = json.loads(self.trace.read_text())["env"]
+        self.assertEqual(env["HOME"], str(self.home))
+        self.assertEqual(env["XDG_CONFIG_HOME"], str(self.home / "xdg"))
+        self.assertEqual({key: env[key] for key in self.kept}, self.kept)
+        self.assertEqual(env["CLAUDE_CODE_TMPDIR"], str(d / "scratch"))
+        self.assertEqual(meta["workspace_phase"], "no_changes")
+
     def test_linked_worktree_protects_original_paths_with_spaces(self):
         cc.git(self.project, "init", "-q")
         cc.git(self.project, "-c", "user.name=fixture", "-c", "user.email=f@example.invalid",

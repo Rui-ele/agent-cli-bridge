@@ -38,6 +38,9 @@ while True:
         result = dict(protocolVersion=1)
     elif method in ("session/new", "session/resume", "session/load"):
         assert params["cwd"] == os.getcwd() and params["mcpServers"] == []
+        if os.getenv("ACP_REQUIRE_MARKER") and not (Path.home() / ".gemini" / "fixture-marker").is_file():
+            send(id=req["id"], error=dict(code=-32000, message="Authentication required"))
+            continue
         if method != "session/new":
             session = params["sessionId"]
         if method == "session/resume" and os.getenv("ACP_LOAD"):
