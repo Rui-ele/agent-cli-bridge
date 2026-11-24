@@ -144,6 +144,69 @@ class ClaudeSdkCase(unittest.TestCase):
         with patch.object(Path, "exists", publish_then_finish):
             self.assertEqual(cc.sdk_request(directory, "finish")["status"], "finished")
 
+    def test_receipt_with_null_or_malformed_usage(self):
+        for counts, total in (({"input_tokens": None, "output_tokens": 7}, 7), (["invalid"], 0)):
+            with self.subTest(counts=counts), patch.dict(os.environ, {"SDK_USAGE": json.dumps(counts)}):
+                _, result = self.run_task()
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["worker_usage"]["input_tokens"], 0)
+                self.assertEqual(result["worker_usage"]["total_tokens"], total)
+
+    def test_supervisor_exit_between_starting_and_worker_pid(self):
+        cc.git(self.project, "init", "-q", "-b", "main")
+        cc.git(self.project, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+               "commit", "--allow-empty", "-qm", "base")
+
+        def exit_before_launch(cmd, cwd, directory, *args):
+            self.assertIn('status="running"', self.call("status", directory.name))
+            self.assertIn("runs=0", self.call("prune", "--older-than", "0"))
+            raise SystemExit
+
+        with patch.object(cc, "supervise", exit_before_launch), self.assertRaises(SystemExit):
+            self.call(*self.argv, "--mode", "write")
+        directory, = self.runs.glob("*-claude-*")
+        meta = json.loads((directory / "meta.json").read_text())
+        self.assertNotIn("worker_pid", meta)
+        tree = Path(meta["worktree"])
+        self.assertTrue(tree.is_dir())
+        with patch.object(time, "sleep", side_effect=AssertionError("waited on orphan")):
+            status = self.call("status", directory.name)
+            self.assertIn('status="outcome_unknown"', status)
+            self.assertIn("sdk_supervisor_exited", status)
+            for action in [("queue", directory.name, "--message", "more"), ("cancel", directory.name)]:
+                self.assertIn("sdk_supervisor_exited", self.call(*action, expected=1))
+        self.assertFalse((directory / "cancel.requested").exists())
+        self.assertIn("clones=1", self.call("prune", "--older-than", "0"))
+        self.assertFalse(directory.exists() or tree.exists())
+
+    def test_failed_sdk_checkout_keeps_recovery_path_in_receipt(self):
+        cc.git(self.project, "init", "-q", "-b", "main")
+        cc.git(self.project, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+               "commit", "--allow-empty", "-qm", "base")
+
+        def partial_checkout(repo, cwd, gitdir, branch, base):
+            cwd.mkdir()
+            raise OSError("fixture_checkout_failed")
+
+        with patch.object(cc, "isolated_checkout", partial_checkout):
+            directory, result = self.run_task("--mode", "write", expected=1)
+        tree = cc.clone_root(self.project) / directory.name
+        self.assertEqual(result["worktree"], str(tree))
+        self.assertIn("inspection_failed", self.call("prune", "--older-than", "0"))
+        self.assertTrue(tree.is_dir() and directory.is_dir())
+
+    def test_control_waits_notice_lease_release(self):
+        directory = self.root / "run"
+        (directory / "sdk-control").mkdir(parents=True)
+        for wait in (lambda: cc.sdk_request(directory, "queue", message="more"),
+                     lambda: cc.wait_result(directory / "result.json", 10)):
+            with (directory / ".sdk-active.lock").open("w") as lease:
+                cc.fcntl.flock(lease, cc.fcntl.LOCK_EX)
+                with patch.object(time, "sleep", side_effect=lambda _: lease.close()) as sleep:
+                    with self.assertRaisesRegex(cc.Blocked, "sdk_supervisor_exited"):
+                        wait()
+                    sleep.assert_called_once()
+
     def test_orphan_disconnects_and_prune_preserves_dirty_clone(self):
         cc.git(self.project, "init", "-q", "-b", "main")
         cc.git(self.project, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",

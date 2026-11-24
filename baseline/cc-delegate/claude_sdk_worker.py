@@ -79,10 +79,10 @@ class Session:
         async def envelope():
             yield {"type": "user", "uuid": key, "message": {"role": "user", "content": text},
                    "parent_tool_use_id": None}
-        await self.client.query(envelope())
         if self.idle:
             self.idle = False
             self.idle_path.unlink(missing_ok=True)
+        await self.client.query(envelope())
         self.outstanding.add(key)
         emit("sdk.input", message_uuid=key, after_result=self.turn)
 
@@ -212,9 +212,11 @@ class Session:
         self.turn += 1
         self.session_id = msg.session_id
         self.denials.extend(getattr(msg, "permission_denials", None) or [])
+        counts = msg.usage if isinstance(msg.usage, dict) else {}
         for field in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
-            self.usage[field] += (msg.usage or {}).get(field) or 0
-        covered = list(getattr(msg, "user_message_uuids", None) or [])
+            self.usage[field] += counts.get(field) or 0
+        reported_ids = getattr(msg, "user_message_uuids", None)
+        covered = list(reported_ids or [])
         first = getattr(msg, "user_message_uuid", None)
         if first and first not in covered:
             covered.append(first)
@@ -222,13 +224,16 @@ class Session:
              subtype=msg.subtype, is_error=msg.is_error, terminal_reason=getattr(msg, "terminal_reason", None),
              result=msg.result, structured_output=msg.structured_output, usage=msg.usage,
              total_cost_usd=msg.total_cost_usd, modelUsage=getattr(msg, "model_usage", None) or {})
-        if covered:
+        if covered or reported_ids is not None:
             matched = self.outstanding.intersection(covered)
             if not matched:
                 return False
         else:
             origin = getattr(msg, "origin", None) or {}
             if origin.get("kind") not in (None, "human") or not self.outstanding:
+                return False
+            if self.interrupting and origin.get("kind") is None:
+                # Background results can arrive before the interrupted prompt is acknowledged.
                 return False
             if len(self.outstanding) != 1:
                 raise RuntimeError("sdk_result_missing_message_ids: unable to correlate overlapping inputs")
@@ -242,7 +247,7 @@ class Session:
             if self.outstanding:
                 # Interruption may discard further results. Don't send a replacement until
                 # every prompt is accounted for, even when the CLI returned a UUID list.
-                if self.interrupting or not getattr(msg, "user_message_uuids", None):
+                if self.interrupting or reported_ids is None:
                     self.correlation_deadline = asyncio.get_running_loop().time() + CORRELATION_TIMEOUT
                 return False
             self.interrupting = False

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shlex
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -128,6 +129,85 @@ class PruneCase(unittest.TestCase):
         cc.git(self.repo, "fetch", str(clone), f"HEAD:refs/heads/{branch}")
         result = self.prune()
         self.assertEqual((result["runs"], result["clones"], result["kept_branches"]), (1, 1, [branch]))
+
+    def test_clone_view_uses_host_case_and_unicode_settings(self):
+        for key in ("core.ignorecase", "core.precomposeunicode"):
+            cc.git(self.repo, "config", key, "true")
+        (self.repo / "note").write_text("tracked\n")
+        cc.git(self.repo, "add", "note")
+        cc.git(self.repo, "commit", "-qm", "track lowercase path")
+        self.base = cc.git(self.repo, "rev-parse", "HEAD").strip()
+        d = self.make_run(clone=True)
+        clone = cc.clone_root(self.repo) / d.name
+        for key in ("core.ignorecase", "core.precomposeunicode"):
+            cc.git(clone, "config", key, "false")
+        (clone / "note").rename(clone / "NOTE")
+        if not (clone / "note").exists():
+            # Reproduce both spellings referring to the same contents on case-sensitive CI.
+            os.link(clone / "NOTE", clone / "note")
+        self.assertIn("NOTE", cc.git(clone, "status", "--porcelain"))
+        with cc.clone_view(self.repo, clone) as (_, inspect, _env):
+            self.assertEqual(inspect("config", "--bool", "core.precomposeunicode").strip(), "true")
+            self.assertEqual(cc.diff_info(inspect, self.base), ([], []))
+        self.assertEqual(self.prune()["clones"], 1)
+
+    def test_clone_metadata_must_match_expected_type(self):
+        d = self.make_run(clone=True)
+        clone = cc.clone_root(self.repo) / d.name
+        sidecar = clone.parent / (".git-" + d.name)
+        for name in ("objects", "refs", "logs", "reftable", "index", "packed-refs", "shallow", "sharedindex.sample"):
+            path = sidecar / name
+            saved = self.root / "original"
+            if path.exists():
+                path.rename(saved)
+            try:
+                for variant in ("symlink", "wrong_type"):
+                    with self.subTest(name=name, variant=variant):
+                        if variant == "symlink":
+                            path.symlink_to(saved)
+                        elif name in ("objects", "refs", "logs", "reftable"):
+                            path.touch()
+                        else:
+                            os.mkfifo(path)
+                        try:
+                            with self.assertRaisesRegex(cc.Blocked, "invalid_clone_metadata_type"):
+                                with cc.clone_view(self.repo, clone):
+                                    pass
+                        finally:
+                            path.unlink()
+            finally:
+                if saved.exists():
+                    saved.rename(path)
+
+    def test_prune_keeps_clone_when_inspection_times_out(self):
+        d = self.make_run(clone=True)
+        communicate = subprocess.Popen.communicate
+
+        def timed_out(proc, *args, **kwargs):
+            if "status" in proc.args and any(arg.startswith("--git-dir=") for arg in proc.args):
+                self.assertEqual(kwargs.get("timeout"), 7)
+                raise subprocess.TimeoutExpired(proc.args, 7)
+            return communicate(proc, *args, **kwargs)
+
+        with patch.dict(os.environ, {"CC_DELEGATE_GIT_TIMEOUT": "7"}), patch.object(subprocess.Popen, "communicate", timed_out):
+            self.assertEqual(self.prune()["kept_clones"], [dict(task_id=d.name, reason="clone_inspection_timeout")])
+        self.assertTrue((cc.clone_root(self.repo) / d.name).is_dir())
+
+    def test_prune_keeps_hidden_worktree_changes(self):
+        (self.repo / "file").write_text("original")
+        cc.git(self.repo, "add", "file")
+        cc.git(self.repo, "commit", "-qm", "track file")
+        self.base = cc.git(self.repo, "rev-parse", "HEAD").strip()
+        runs = [self.make_run(clone=True) for _ in range(2)]
+        for flag, d in zip(("--assume-unchanged", "--skip-worktree"), runs):
+            clone = cc.clone_root(self.repo) / d.name
+            cc.git(clone, "update-index", flag, "--", "file")
+            (clone / "file").write_text("unsaved work")
+            self.assertFalse(cc.git(clone, "status", "--porcelain"))
+        self.assertEqual(self.prune()["kept_clones"], [dict(task_id=d.name, reason="index_flags_hide_changes")
+                                                      for d in runs])
+        for d in runs:
+            self.assertEqual((cc.clone_root(self.repo) / d.name / "file").read_text(), "unsaved work")
 
     def test_prune_ignores_clone_filters_and_retains_dirty_work(self):
         (self.repo / "draft").write_text("base")

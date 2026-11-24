@@ -150,11 +150,14 @@ class ClaudeSDKClient:
                 reply = "first reply" if first and len(consumed) == 1 else f"follow up: {prompt}"
                 structured = dict(status="ok", summary=[reply], uncertainties=[], report_markdown=reply)
             trace("result", is_error=failed)
-            yield ResultMessage("error_during_execution" if failed else "success", self.session,
-                                reply, structured, failed,
-                                terminal_reason="aborted_tools" if interrupted else "completed",
-                                user_message_uuid=None if scenario == "missing_ids" else consumed[-1],
-                                user_message_uuids=None if scenario == "missing_ids" else consumed)
+            result = ResultMessage("error_during_execution" if failed else "success", self.session,
+                                   reply, structured, failed,
+                                   terminal_reason="aborted_tools" if interrupted else "completed",
+                                   user_message_uuid=None if scenario == "missing_ids" else consumed[-1],
+                                   user_message_uuids=None if scenario == "missing_ids" else consumed)
+            if "SDK_USAGE" in os.environ:
+                result.usage = json.loads(os.environ["SDK_USAGE"])
+            yield result
 
     async def receive_response(self):
         async for msg in self.receive_messages():

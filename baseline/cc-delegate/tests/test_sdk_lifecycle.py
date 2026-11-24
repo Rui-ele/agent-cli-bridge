@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -31,7 +32,8 @@ class InterruptCorrelation(unittest.IsolatedAsyncioTestCase):
     def result(self, ids=None, origin=None):
         msg = ResultMessage("success", "session", "answer", None, False,
                             terminal_reason="aborted_streaming", user_message_uuids=ids)
-        msg.origin = {"kind": origin}
+        if origin is not None:
+            msg.origin = {"kind": origin}
         return self.session.result(msg)
 
     async def test_only_matching_ids_release_replacement(self):
@@ -60,3 +62,42 @@ class InterruptCorrelation(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "sdk_result_timeout"):
                 await self.session.controls()
         self.session.client.query.assert_not_awaited()
+
+    async def test_unidentified_interrupt_result_waits_for_remaining_id(self):
+        with patch.object(worker, "CORRELATION_TIMEOUT", 0):
+            await self.session.command(dict(action="interrupt", message="replacement"))
+            await self.result(["first"])
+            for ids, origin in ((None, None), ([], None), ([], "human")):
+                with self.subTest(ids=ids, origin=origin):
+                    self.assertFalse(await self.result(ids, origin))
+                    self.assertEqual(self.session.outstanding, {"steer"})
+                    self.session.client.query.assert_not_awaited()
+            with self.assertRaisesRegex(RuntimeError, "sdk_result_timeout"):
+                await self.session.controls()
+
+    async def test_legacy_human_interrupt_without_uuid_list(self):
+        await self.session.command(dict(action="interrupt"))
+        await self.result(["first"])
+        self.assertTrue(await self.result(None, "human"))
+        self.assertEqual(self.session.last_result["result"], "turn_interrupted")
+
+    async def test_blocked_query_clears_idle_marker_before_sending(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_send(envelope):
+            started.set()
+            await release.wait()
+
+        self.session.client.query.side_effect = blocked_send
+        self.session.outstanding.clear()
+        self.session.idle = True
+        self.session.idle_path.touch()
+        sending = asyncio.create_task(self.session.command(dict(action="queue", message="follow-up")))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=1)
+            self.assertFalse(self.session.idle_path.exists())
+            self.assertFalse(self.session.idle)
+        finally:
+            release.set()
+            await sending

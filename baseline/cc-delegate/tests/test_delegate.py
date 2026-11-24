@@ -985,6 +985,31 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))
         self.assertNotIn("branch=", self.receipt)
         self.assertFalse(cc.git(self.project, "show-ref", "--verify", "refs/heads/delegate/" + d.name, check=False))
 
+    def test_publish_timeout_writes_receipt_and_skips_landing(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "feature")
+        self.worker("codex", f"""
+sys.stdin.read()
+import subprocess
+subprocess.run(["git", "-c", "user.name=W", "-c", "user.email=w@example.invalid",
+                "commit", "--allow-empty", "-qm", "worker commit"], check=True)
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))
+""")
+        communicate = subprocess.Popen.communicate
+
+        def fetch_timeout(proc, *args, **kwargs):
+            if "fetch" in proc.args:
+                self.assertEqual(kwargs.get("timeout"), 5)
+                raise subprocess.TimeoutExpired(proc.args, 5)
+            return communicate(proc, *args, **kwargs)
+
+        with patch.dict(os.environ, {"CC_DELEGATE_GIT_TIMEOUT": "5"}), \
+                patch.object(subprocess.Popen, "communicate", fetch_timeout):
+            _, data = self.run_task("--mode", "write", "--onto", "feature", expected=2)
+        self.assertEqual((data["status"], data["reason"]), ("outcome_unknown", "clone_inspection_timeout"))
+        self.assertEqual(cc.git(self.project, "rev-parse", "feature").strip(), data["base_sha"])
+        self.assertTrue(Path(data["worktree"]).is_dir())
+
     def test_uncommitted_work_keeps_diff_without_landing(self):
         self.commit_fixture()
         cc.git(self.project, "branch", "feature")
@@ -1036,6 +1061,35 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
                              (["--onto", "feature", "--base", "main"], "onto_and_base_conflict")):
             d, data = self.run_task("--mode", "write", *args, expected=1)
             self.assertEqual(data["reason"], reason)
+
+    def test_landing_and_resuming_ignore_versioned_hooks(self):
+        self.commit_fixture()
+        cc.git(self.project, "checkout", "-qb", "feature")
+        # The clone and the host pick up the same relative hooksPath from the test user's config.
+        cc.git(self.project, "config", "--global", "core.hooksPath", ".hooks")
+        self.worker("codex", f"""
+sys.stdin.read()
+import subprocess
+Path(".hooks").mkdir()
+for name in ("post-merge", "post-checkout"):
+    hook = Path(".hooks") / name
+    hook.write_text("#!/bin/sh\\n: > fixture-hook-ran\\n")
+    hook.chmod(0o755)
+subprocess.run(["git", "add", ".hooks"], check=True)
+subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "commit", "-qm", "Add fixture hooks"], check=True)
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))
+""")
+        first, data = self.run_task("--mode", "write", "--onto", "feature")
+        self.assertEqual(cc.git(self.project, "rev-parse", "HEAD").strip(), data["onto_after"])
+        self.assertTrue(os.access(self.project / ".hooks/post-merge", os.X_OK))
+        self.assertFalse((self.project / "fixture-hook-ran").exists())
+
+        self.worker("codex", f'sys.stdin.read()\nPath(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))')
+        _, resumed = self.run_task("--mode", "write", "--base", first.name)
+        tree = Path(resumed["worktree"])
+        self.assertTrue(os.access(tree / ".hooks/post-checkout", os.X_OK))
+        self.assertFalse((tree / "fixture-hook-ran").exists())
 
     def test_parallel_writers_land_without_false_breach(self):
         self.commit_fixture()

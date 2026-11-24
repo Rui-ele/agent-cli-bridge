@@ -114,6 +114,10 @@ class Blocked(Exception):
     pass
 
 
+class CloneInspectionTimeout(Blocked):
+    pass
+
+
 class WorkerLaunchError(Exception):
     pass
 
@@ -237,21 +241,22 @@ def load_codex_session(path, tier):
     explicit_turn = False
 
     def finish_turn():
-        if explicit_turn and any(role == "user" for role, _ in turn):
-            turns.append(turn.copy())
-        else:
-            # Count user turns conservatively: empty/control-only tasks cannot absorb a rollback.
-            # In older rollouts without task_started, each user message begins a turn.
-            for role, blocks in turn:
-                if role == "user" or not turns:
-                    turns.append([])
-                turns[-1].append((role, blocks))
+        if turn:
+            if turns and not any(role == "user" for role, _ in turn):
+                # A control-only task cannot absorb a user rollback.
+                turns[-1].extend(turn)
+            else:
+                turns.append(turn.copy())
         turn.clear()
         unpaired.clear()
 
     def dialogue(role, blocks, legacy):
         # Preserve the first position and pair occurrences one-to-one across the two formats.
         message = "".join(b["text"] for b in blocks)
+        if role == "user" and not explicit_turn and turn:
+            # Without start markers only the opening user record can be a duplicate.
+            if len(turn) != 1 or not unpaired.get((role, message, not legacy)):
+                finish_turn()
         other = unpaired[role, message, not legacy]
         if other:
             index = other.popleft()
@@ -270,6 +275,10 @@ def load_codex_session(path, tier):
             finish_turn()
             explicit_turn = True
             continue
+        if kind in ("task_complete", "turn_completed"):
+            finish_turn()
+            explicit_turn = False
+            continue
         if kind == "thread_rolled_back":
             finish_turn()
             explicit_turn = False
@@ -281,12 +290,18 @@ def load_codex_session(path, tier):
             continue
         if kind in ("user_message", "agent_message") and isinstance(event.get("message"), str):
             role = "user" if kind == "user_message" else "assistant"
-            dialogue(role, [{"type": "text", "text": event["message"]}], True)
+            text = event["message"]
+            if role == "user" and not text.strip() and (event.get("images") or event.get("local_images")):
+                text = "[image omitted]"
+            dialogue(role, [{"type": "text", "text": text}], True)
             continue
         item = event.get("item")
         if kind != "item_completed" or not isinstance(item, dict):
             continue
         kind = item.get("type")
+        if not explicit_turn and kind != "UserMessage" and len(turn) == 1 and turn[0][0] == "user":
+            # Tool-only replies still separate prompts when their output is omitted.
+            unpaired.clear()
         if kind in ("UserMessage", "AgentMessage"):
             role = "user" if kind == "UserMessage" else "assistant"
             content = item.get("content")
@@ -295,6 +310,10 @@ def load_codex_session(path, tier):
             blocks = [{"type": "text", "text": part["text"]} for part in content
                       if isinstance(part, dict) and part.get("type") in ("text", "Text")
                       and isinstance(part.get("text"), str) and part["text"].strip()]
+            if role == "user" and not blocks and any(
+                    isinstance(p, dict) and p.get("type") in ("image", "Image", "local_image", "localImage", "LocalImage")
+                    for p in content):
+                blocks = [{"type": "text", "text": "[image omitted]"}]
             if blocks:
                 dialogue(role, blocks, False)
         elif kind == "CommandExecution" and tier != "scoped":
@@ -1502,8 +1521,10 @@ class ClaudePrint(SeatbeltDriver):
 
     @staticmethod
     def usage(raw):
-        counts = raw.get("usage") or {}
-        usage = {k: counts.get(k, 0) for k in ("input_tokens", "output_tokens",
+        counts = raw.get("usage")
+        if not isinstance(counts, dict):
+            counts = {}
+        usage = {k: counts.get(k) or 0 for k in ("input_tokens", "output_tokens",
                  "cache_creation_input_tokens", "cache_read_input_tokens")}
         usage.update(total_tokens=sum(usage.values()), cost_usd=raw.get("total_cost_usd"),
                      actual_models=list(raw.get("modelUsage") or {}))
@@ -2143,12 +2164,25 @@ def raw_stdout(run_dir):
     return "\n".join(lines)
 
 
-def git(cwd, *argv, check=True, env=None):
-    p = subprocess.run(["git", "-C", str(cwd), *argv], stdin=subprocess.DEVNULL,
-                       capture_output=True, start_new_session=True, env=env)
+def git(cwd, *argv, check=True, env=None, inspect_clone=False):
+    timeout = env_limit("CC_DELEGATE_GIT_TIMEOUT", 60) if inspect_clone else None
+    cmd = ["git", "-C", str(cwd), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *argv]
+    with subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, env=env) as p:
+        try:
+            stdout, _ = p.communicate(timeout=timeout)
+        except BaseException as error:
+            # A fetch may leave upload-pack blocked on the same clone metadata.
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise CloneInspectionTimeout("clone_inspection_timeout") from error
+            raise
     if p.returncode and check:
         raise Blocked(f"git {argv[0]} failed ({p.returncode})")
-    return os.fsdecode(p.stdout) if not p.returncode else ""
+    return os.fsdecode(stdout) if not p.returncode else ""
 
 
 def lock(stack, path, blocking=False, *, create=True):
@@ -2260,27 +2294,37 @@ def clone_view(repo, worktree):
         view = Path(tmp)
         fmt = git(repo, "rev-parse", "--show-object-format").rstrip("\n")
         config = "[core]\n\tbare = true\n"
+        for key in ("ignorecase", "precomposeunicode"):
+            value = git(repo, "config", "--bool", "--default", "false", "--get", "core." + key).strip()
+            config += f"\t{key} = {value}\n"
         extensions = []
         if fmt == "sha256":
             extensions.append("objectFormat = sha256")
         elif fmt != "sha1":
             raise Blocked("unknown_git_object_format")
-        if (sidecar / "reftable").is_dir():
-            extensions.append("refStorage = reftable")
+        directories = ("objects", "refs", "logs", "reftable")
+        files = ("index", "packed-refs", "shallow", *(p.name for p in sidecar.glob("sharedindex.*")))
+        for name in (*directories, *files):
+            path = sidecar / name
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            expected_type = stat.S_IFDIR if name in directories else stat.S_IFREG
+            if stat.S_IFMT(mode) != expected_type:
+                raise Blocked("invalid_clone_metadata_type")
+            (view / name).symlink_to(path)
+            if name == "reftable":
+                extensions.append("refStorage = reftable")
         if extensions:
             config += "\trepositoryFormatVersion = 1\n[extensions]\n\t" + "\n\t".join(extensions) + "\n"
         (view / "config").write_text(config)
         if (sidecar / "HEAD").is_symlink() or not (sidecar / "HEAD").is_file():
             raise Blocked("invalid_clone_head")
         shutil.copyfile(sidecar / "HEAD", view / "HEAD")
-        for name in ("objects", "refs", "logs", "index", "packed-refs", "reftable", "shallow"):
-            if (sidecar / name).exists():
-                (view / name).symlink_to(sidecar / name)
-        for index in sidecar.glob("sharedindex.*"):
-            (view / index.name).symlink_to(index)
 
         def inspect(*argv):
-            return git(view, f"--git-dir={view}", f"--work-tree={worktree}", *argv, env=env)
+            return git(view, f"--git-dir={view}", f"--work-tree={worktree}", *argv, env=env, inspect_clone=True)
 
         yield view, inspect, env
 
@@ -2391,6 +2435,7 @@ def land(repo, common, meta, reply, new):
         meta.pop("rollback")
         return
     if current == onto:
+        # Keep the trusted host's filters so its checkout uses the expected file representation.
         git(repo, "merge", "--ff-only", "-q", new)
     else:
         git(repo, "update-ref", f"refs/heads/{onto}", new, old)
@@ -2541,12 +2586,19 @@ def run(args, driver, quiet=False):
                 cc_cost_after=None, outcome=None, note=None, package_tokens_est=None,
                 redactions=0, loop_warning=False, exit_code=None, report_path=str(d / "report.md"))
     driver = select_driver(args, driver, meta)
-    save_json(d / "meta.json", meta)
     worktree = events = None
     reply = dict(summary=[], uncertainties=[], report_markdown="")
     with ExitStack() as stack:
         finish = stack.enter_context(run_interrupts())
         try:
+            if driver.backend == "sdk" and not args.dry_run:
+                # Publish metadata only after locking. The worker inherits the lease so
+                # recovery also waits for its disconnect when the supervisor exits first.
+                lease = stack.enter_context((d / ".sdk-active.lock").open("xb"))
+                fcntl.flock(lease, fcntl.LOCK_EX)
+                args.sdk_fds = (lease.fileno(),)
+                (d / ".result.lock").touch()
+            save_json(d / "meta.json", meta)
             if depth_exceeded:
                 raise Blocked("delegation_depth_exceeded")
             if args.mode == "ro":
@@ -2624,19 +2676,15 @@ def run(args, driver, quiet=False):
                         lock(publish, common / "cc-delegate-publish.lock", blocking=True)
                         watch_from = time.time()
                         before = checkout_state(Path(repo))
+                    if driver.backend == "sdk":
+                        # Recovery needs the clone path even if checkout stops halfway.
+                        meta["worktree"] = str(cwd)
+                        save_json(d / "meta.json", meta)
                     area.mkdir(exist_ok=True)
                     scratch.mkdir()
                     isolated_checkout(Path(repo), cwd, gitdir, f"delegate/{task_id}", meta["base_sha"])
                     worktree = cwd
                     meta["worktree"] = str(cwd)
-            if driver.backend == "sdk" and not args.dry_run:
-                # Record the clone before allowing orphan recovery. Both processes keep this
-                # flock until exit so prune cannot race SDK disconnect or result publication.
-                save_json(d / "meta.json", meta)
-                (d / ".result.lock").touch()
-                lease = stack.enter_context((d / ".sdk-active.lock").open("xb"))
-                fcntl.flock(lease, fcntl.LOCK_EX)
-                args.sdk_fds = (lease.fileno(),)
             attempt = worker_attempt(driver, args, cwd, d, writable, Path(repo) if repo else None,
                                      prompt, meta, finish)
             if attempt is None:
@@ -2701,9 +2749,8 @@ def run(args, driver, quiet=False):
                     with clone_view(Path(repo), worktree) as (view, inspect, env):
                         new = inspect("rev-list", "-1", f"{meta['base_sha']}..HEAD", "--").strip()
                         if new:
-                            git(Path(repo), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-                                "fetch", "-q", "--no-tags",
-                                "--no-recurse-submodules", str(view), f"+{new}:{ref}", env=env)
+                            git(Path(repo), "fetch", "-q", "--no-tags",
+                                "--no-recurse-submodules", str(view), f"+{new}:{ref}", env=env, inspect_clone=True)
                             meta["branch"] = branch
                             record_landing(common, task_id, ref, after["refs"].get(ref), new)
                         meta["changed_files"], meta["diff_stat"] = diff_info(inspect, meta["base_sha"])
@@ -2724,7 +2771,8 @@ def run(args, driver, quiet=False):
             if publish_error is not None:
                 if not cancelled:
                     meta["status"] = "outcome_unknown"
-                meta.setdefault("reason", "diff_collection_failed")
+                meta.setdefault("reason", str(publish_error) if isinstance(publish_error, CloneInspectionTimeout)
+                                else "diff_collection_failed")
                 reply["uncertainties"].extend(["diff_collection_failed", str(publish_error)])
         meta.update(duration_s=round(time.monotonic()-start, 3), finished_at=now())
         if events is not None:
@@ -2800,10 +2848,19 @@ def control_log(d, action, result, **fields):
         f.write(dumps(dict(ts=now(), action=action, result=result, **fields)) + "\n")
 
 
+def sdk_supervisor_exited(directory):
+    lease = directory / ".sdk-active.lock"
+    with ExitStack() as stack:
+        return (not lease.is_symlink() and lease.is_file() and lock(stack, lease, create=False)
+                and not (directory / "result.json").is_file())
+
+
 def sdk_request(directory, action, timeout=10, **params):
     control = directory / "sdk-control"
     if (directory / "result.json").exists():
         raise Blocked("task_finished")
+    if sdk_supervisor_exited(directory):
+        raise Blocked("sdk_supervisor_exited")
     if not control.is_dir():
         raise Blocked("sdk_control_not_ready")
     nonce = secrets.token_hex(16)
@@ -2812,10 +2869,11 @@ def sdk_request(directory, action, timeout=10, **params):
     deadline = time.monotonic() + timeout
     try:
         while not ack.exists():
-            if (directory / "result.json").exists():
+            exited = sdk_supervisor_exited(directory)
+            if exited or (directory / "result.json").exists():
                 if ack.exists():
                     break
-                raise Blocked("task_finished_without_ack")
+                raise Blocked("sdk_supervisor_exited" if exited else "task_finished_without_ack")
             if time.monotonic() >= deadline:
                 try:
                     request.unlink()
@@ -2858,6 +2916,8 @@ def steer(d, meta, message):
 def wait_result(path, seconds):
     deadline = time.monotonic() + seconds
     while not path.is_file():
+        if sdk_supervisor_exited(path.parent):
+            raise Blocked("sdk_supervisor_exited")
         left = deadline - time.monotonic()
         if left <= 0:
             return False
@@ -2889,6 +2949,8 @@ def cancel(d, seconds):
             control_log(d, "cancel", "task_finished")
             receipt(json.loads(result.read_text()))
             return
+        if sdk_supervisor_exited(d):
+            raise Blocked("sdk_supervisor_exited")
         (d / "cancel.requested").touch()
         control_log(d, "cancel", "requested")
         meta = json.loads((d / "meta.json").read_text())
@@ -2964,6 +3026,9 @@ def preview(value, limit):
 
 
 def running_status(d, meta):
+    if meta.get("backend") == "sdk" and sdk_supervisor_exited(d):
+        print(f'task_id={d.name} status="outcome_unknown" reason="sdk_supervisor_exited"')
+        return
     elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(meta["started_at"])
     driver = recorded_driver(meta)
     backend = driver.backend or meta["worker"]
@@ -3088,14 +3153,19 @@ def prune_clone(repo, task_id, worktree, dry_run, counts, unsafe):
                         or inspect("diff", "--cached", "--name-only", "--ignore-submodules=none", "HEAD", "--")):
                     return "uncommitted_changes"
                 # Entering a populated submodule would load its own untrusted config.
-                for entry in inspect("ls-files", "--stage", "-z").split("\0"):
-                    if entry.startswith("160000 "):
+                for entry in inspect("ls-files", "--stage", "-v", "-z").split("\0"):
+                    # Lowercase tags mark assume-unchanged. S marks skip-worktree.
+                    if entry[:1].islower() or entry.startswith("S "):
+                        return "index_flags_hide_changes"
+                    if entry.startswith("H 160000 "):
                         sub = clone / entry.split("\t", 1)[1]
                         if sub.is_symlink() or not sub.is_dir() or any(sub.iterdir()):
                             return "submodule_checkout"
                 tips = git(repo, "for-each-ref", "--format=%(objectname)", "refs/heads").splitlines()
                 if inspect("rev-list", "-1", "HEAD", "--all", "--reflog", "--not", *tips):
                     return "unique_commits"
+        except CloneInspectionTimeout as error:
+            return str(error)
         except (Blocked, OSError):
             return "inspection_failed"
     if not dry_run:
@@ -3122,7 +3192,7 @@ def prune_run(d, cutoff, dry_run, counts, kept, kept_clones, unsafe):
                 return False
         else:
             lease = d / ".sdk-active.lock"
-            if (result.exists() or meta.get("backend") != "sdk" or not meta.get("worker_pid")
+            if (result.exists() or meta.get("backend") != "sdk"
                     or not lease.is_file() or lease.is_symlink() or not lock(stack, lease, create=False)):
                 return False
             # A crashed supervisor cannot timestamp its exit. Age the run by its last recorded activity.

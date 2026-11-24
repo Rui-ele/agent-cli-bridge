@@ -67,3 +67,42 @@ class CodexHistoryCase(unittest.TestCase):
         self.assertEqual([(role, [b["text"] for b in blocks]) for role, blocks in messages],
                          [("user", ["first"]), ("user", ["steer"]), ("assistant", ["one", " reply"]),
                           ("assistant", ["one reply"]), ("assistant", ["more"]), ("assistant", ["last"])])
+
+    def test_image_only_turn_owns_its_reply_and_rollback(self):
+        image = item("UserMessage", content=[{"type": "LocalImage", "path": "private-image"}])
+        previous = [legacy("user", "keep question"), legacy("agent", "keep answer")]
+        for starts in ([], [{"type": "task_started"}]):
+            for formats in ([image], [dict(legacy("user", ""), local_images=["private-image"]), image]):
+                with self.subTest(starts=starts, formats=formats):
+                    history = [*starts, *previous, *starts, *formats, modern("Agent", "image answer")]
+                    self.write(*history)
+                    before = self.prompt("scoped")
+                    self.assertEqual(before.count("[image omitted]"), 1)
+                    self.assertNotIn("private-image", before)
+                    self.write(*history, {"type": "thread_rolled_back", "num_turns": 1})
+                    after = self.prompt("scoped")
+                    self.assertIn("keep question", after)
+                    self.assertIn("keep answer", after)
+                    self.assertNotIn("image answer", after)
+                    self.assertNotIn("[image omitted]", after)
+
+    def test_implicit_turns_never_pair_across_replies(self):
+        self.write(legacy("user", "again"), legacy("agent", "same reply"),
+                   modern("User", "again"), modern("Agent", "same reply"),
+                   legacy("agent", "same reply"), modern("Agent", "last reply"))
+        history = cc.load_codex_session(self.path, "full")
+        self.assertEqual([blocks[0]["text"] for _, blocks in history],
+                         ["again", "same reply", "again", "same reply", "last reply"])
+
+    def test_completion_separates_identical_implicit_prompts_without_replies(self):
+        self.write(legacy("user", "again"), {"type": "task_complete"}, modern("User", "again"),
+                   {"type": "thread_rolled_back", "num_turns": 1})
+        self.assertIn("again", self.prompt("scoped"))
+
+    def test_tool_only_reply_separates_repeated_implicit_prompt_in_scoped_context(self):
+        self.write(legacy("user", "again"),
+                   item("CommandExecution", id="cmd", command=["pwd"], aggregated_output="tool output"),
+                   modern("User", "again"), {"type": "thread_rolled_back", "num_turns": 1})
+        prompt = self.prompt("scoped")
+        self.assertIn("again", prompt)
+        self.assertNotIn("tool output", prompt)
