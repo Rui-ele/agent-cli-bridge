@@ -64,19 +64,26 @@ class ClaudeCase(unittest.TestCase):
         self.assertEqual(self.trace.with_suffix(".profile").read_text(), str(d / "sandbox.sb"))
         text = (d / "sandbox.sb").read_text()
         prefix = "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n"
-        self.assertTrue(text.startswith(prefix) and text.endswith(")\n"))
+        self.assertTrue(text.startswith(prefix))
         paths, regexes = [], []
-        for line in text[len(prefix):-2].splitlines():
+        allows, _, denials = text[len(prefix):].partition("\n(deny ")
+        self.assertTrue(denials)
+        for line in allows[:-1].splitlines():
             kind, literal = re.fullmatch(r"    \((subpath|regex) (.*)\)", line).groups()
             (paths if kind == "subpath" else regexes).append(json.loads(literal))
-        states = ("projects sessions session-env shell-snapshots state cache file-history todos plans "
+        states = ("sessions session-env shell-snapshots state cache file-history todos plans "
                   "debug statsig telemetry backups paste-cache ide").split()
-        expected = [config / s for s in states] + [self.tmp, Path("/dev"), Path("/private/var/folders"),
-                                                   Path(f"/private/tmp/claude-{os.getuid()}"), *extra]
+        worker_env = json.loads(self.trace.read_text())["env"]
+        scratch = Path(worker_env["TMPDIR"])
+        self.assertEqual(worker_env["CLAUDE_CODE_TMPDIR"], str(scratch))
+        self.assertNotEqual(scratch, self.tmp)
+        if not extra:
+            self.assertEqual(scratch.parent, d)
+            self.assertIn(f"(deny file-write* (literal {json.dumps(str(scratch))}))", text)
+        cwd = extra[0] if extra else self.project
+        expected = {config / s for s in states} | {
+            scratch, Path("/dev"), config / "projects" / cc.claude_project_name(cwd), *extra}
         self.assertCountEqual(paths, map(str, (p.resolve() for p in expected)))
-        self.assertEqual(len(regexes), 2)
-        marker = r"^/private/tmp/claude-[0-9a-f]+-cwd$"
-        regexes.remove(marker)
         pattern, = regexes
         for suffix in ("", ".lock", ".backup"):
             self.assertTrue(re.match(pattern, str(self.home / (".claude.json" + suffix))))
@@ -106,7 +113,8 @@ class ClaudeCase(unittest.TestCase):
                          "--add-dir", str(self.root), "--effort", "high", "--resume", "old-session"])
         self.assertFalse(set(self.removed).intersection(trace["env"]))
         self.assertEqual({k: trace["env"][k] for k in self.kept}, self.kept)
-        self.assertEqual((trace["env"]["CC_DELEGATE_DEPTH"], trace["env"]["TMPDIR"]), ("2", str(self.tmp)))
+        self.assertEqual(trace["env"]["CC_DELEGATE_DEPTH"], "2")
+        self.assertFalse(Path(trace["env"]["TMPDIR"]).exists())
         self.check_profile(d, Path(self.kept["CLAUDE_CONFIG_DIR"]))
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -142,6 +150,22 @@ class ClaudeCase(unittest.TestCase):
         self.assertEqual(trace["env"]["TMPDIR"], str(scratch))
         self.assertEqual((meta["status"], meta["backend"], meta["context_window"], meta["window_estimated"]),
                          ("ok", "print", 1000000, True))
+
+    def test_linked_worktree_protects_original_paths_with_spaces(self):
+        cc.git(self.project, "init", "-q")
+        cc.git(self.project, "-c", "user.name=fixture", "-c", "user.email=f@example.invalid",
+               "commit", "--allow-empty", "-qm", "base")
+        linked = self.root / "linked checkout "
+        cc.git(self.project, "worktree", "add", "-q", "--detach", str(linked))
+        d, _ = self.run_task("--project-dir", str(linked), "--mode", "write")
+        profile = (d / "sandbox.sb").read_text()
+        for path in (linked, self.project / ".git"):
+            self.assertIn(f"(deny file-write* (subpath {json.dumps(str(path))}))", profile)
+
+    def test_claude_project_name_matches_utf16_and_long_path_suffix(self):
+        self.assertEqual(cc.claude_project_name("/test/V.1🚗"), "-test-V-1--")
+        self.assertEqual(cc.claude_project_name("/test/" + "a" * 195 + "🚗"),
+                         "-test-" + "a" * 194 + "-2029bh")
 
     def test_result_variants(self):
         for scenario in ("error", "max_turns", "text", "loop"):

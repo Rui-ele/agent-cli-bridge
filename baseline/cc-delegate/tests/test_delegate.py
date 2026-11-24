@@ -923,6 +923,25 @@ Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps(""" + repr(ANSWER) 
         d, data = self.run_task("--mode", "write", "--base", "no-such-ref", expected=1)
         self.assertEqual((data["status"], data["reason"]), ("blocked", "unknown_base_ref"))
 
+    def test_host_finalization_ignores_worker_git_config(self):
+        self.commit_fixture()
+        marker = self.root / "filter-ran"
+        self.worker("codex", f"""
+sys.stdin.read()
+import subprocess, shlex
+subprocess.run(["git","-c","user.name=W","-c","user.email=w@example.invalid",
+                "commit","--allow-empty","-qm","worker"], check=True)
+subprocess.run(["git","config","filter.fixture.clean","touch " + shlex.quote({str(marker)!r}) + " && cat"],
+               check=True)
+Path(".gitattributes").write_text("a filter=fixture\\n")
+Path("a").write_text("dirty\\n")
+Path(sys.argv[sys.argv.index("-o")+1]).write_text(json.dumps({ANSWER!r}))
+""")
+        d, data = self.run_task("--mode", "write")
+        self.assertEqual(data["changed_files"], [".gitattributes", "a"])
+        self.assertEqual(cc.git(self.project, "log", "-1", "--format=%s", "delegate/" + d.name).strip(), "worker")
+        self.assertFalse(marker.exists())
+
     def test_reediting_dirty_file_reports_breach(self):
         self.commit_fixture()
         path = self.project / "a"

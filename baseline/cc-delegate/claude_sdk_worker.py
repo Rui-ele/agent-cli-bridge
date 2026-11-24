@@ -37,7 +37,7 @@ class Session:
         self.control.mkdir(mode=0o700, exist_ok=True)
         self.permissions = {}
         self.lock = asyncio.Lock()
-        self.outstanding = {}  # insertion order identifies the prompt that started a turn
+        self.outstanding = set()
         self.queued = deque()
         self.interrupting = self.cancelling = self.closed = False
         self.turn = 0
@@ -50,9 +50,9 @@ class Session:
         self.idle_path = self.control / "idle.json"
 
     async def permission(self, tool_name, input_data, context):
-        self.correlation_deadline = None
         if self.args.approval != "ask" or self.cancelling or self.interrupting:
             return self.sdk.PermissionResultDeny(message="Tool has no approval for this task.")
+        self.correlation_deadline = None
         key = uuid.uuid4().hex
         request = dict(request_id=key, tool_name=tool_name, input=input_data,
                        tool_use_id=getattr(context, "tool_use_id", None),
@@ -83,7 +83,7 @@ class Session:
         if self.idle:
             self.idle = False
             self.idle_path.unlink(missing_ok=True)
-        self.outstanding[key] = None
+        self.outstanding.add(key)
         emit("sdk.input", message_uuid=key, after_result=self.turn)
 
     def finish(self):
@@ -139,6 +139,7 @@ class Session:
                 self.interrupting = False
                 raise
             self.decline_pending()
+            self.correlation_deadline = asyncio.get_running_loop().time() + CORRELATION_TIMEOUT
             if text:
                 self.queued.appendleft((text, key))
             return dict(status="interrupt_requested", message_uuid=key if text else None)
@@ -184,7 +185,7 @@ class Session:
 
     def progress(self, message):
         kind = type(message).__name__
-        if kind in ("StreamEvent", "AssistantMessage", "UserMessage"):
+        if not self.interrupting and kind in ("StreamEvent", "AssistantMessage", "UserMessage"):
             self.correlation_deadline = None
         if kind == "SystemMessage" and message.subtype == "init":
             self.session_id = message.data.get("session_id")
@@ -220,29 +221,31 @@ class Session:
         emit("sdk.turn_result", turn=self.turn, session_id=msg.session_id, user_message_uuids=covered,
              subtype=msg.subtype, is_error=msg.is_error, terminal_reason=getattr(msg, "terminal_reason", None),
              result=msg.result, structured_output=msg.structured_output, usage=msg.usage,
-             total_cost_usd=msg.total_cost_usd)
+             total_cost_usd=msg.total_cost_usd, modelUsage=getattr(msg, "model_usage", None) or {})
+        if covered:
+            matched = self.outstanding.intersection(covered)
+            if not matched:
+                return False
+        else:
+            origin = getattr(msg, "origin", None) or {}
+            if origin.get("kind") not in (None, "human") or not self.outstanding:
+                return False
+            if len(self.outstanding) != 1:
+                raise RuntimeError("sdk_result_missing_message_ids: unable to correlate overlapping inputs")
+            # Older CLIs omit the UUID even for a single foreground prompt.
+            matched = self.outstanding.copy()
+        self.outstanding.difference_update(matched)
         terminal = getattr(msg, "terminal_reason", None)
         interrupted = terminal in ("aborted_tools", "aborted_streaming") or (not terminal and self.interrupting)
         stop_requested = self.interrupting
-        if not covered and not self.cancelling:
-            origin = getattr(msg, "origin", None) or {}
-            if origin.get("kind") not in (None, "human") and not self.interrupting:
-                return False
-            if len(self.outstanding) > 1 and not self.interrupting:
-                raise RuntimeError("sdk_result_missing_message_ids: unable to correlate overlapping inputs")
-            # Older CLIs and interrupted turns may omit the UUID, even on an error.
-            covered = list(self.outstanding)[:1]
-        for key in covered:
-            self.outstanding.pop(key, None)
-        if self.interrupting:
-            self.interrupting = False
         if not self.cancelling:
             if self.outstanding:
-                # Old CLIs may identify only the last of several coalesced messages. Wait
-                # for evidence of another turn without timing out active work or approvals.
-                if not getattr(msg, "user_message_uuids", None):
+                # Interruption may discard further results. Don't send a replacement until
+                # every prompt is accounted for, even when the CLI returned a UUID list.
+                if self.interrupting or not getattr(msg, "user_message_uuids", None):
                     self.correlation_deadline = asyncio.get_running_loop().time() + CORRELATION_TIMEOUT
                 return False
+            self.interrupting = False
             self.correlation_deadline = None
             if self.queued:
                 await self.send(*self.queued.popleft())
@@ -312,9 +315,25 @@ class Session:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def run_with_supervisor(args, sdk, prompt):
+    if os.getppid() != args.supervisor_pid:
+        return
+    session = asyncio.create_task(Session(args, sdk).run(prompt))
+    try:
+        while os.getppid() == args.supervisor_pid:
+            done, _ = await asyncio.wait([session], timeout=.25)
+            if done:
+                return session.result()
+    finally:
+        if not session.done():
+            session.cancel()
+            await asyncio.gather(session, return_exceptions=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--supervisor-pid", required=True, type=int)
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--cli-path", required=True)
     parser.add_argument("--model", required=True)
@@ -334,7 +353,7 @@ def main():
                 raise
             raise RuntimeError("Claude Agent SDK missing: set CC_DELEGATE_SDK_PYTHON to the Python "
                                "environment containing claude-agent-sdk (see README)") from exc
-        asyncio.run(Session(args, claude_agent_sdk).run(sys.stdin.read()))
+        asyncio.run(run_with_supervisor(args, claude_agent_sdk, sys.stdin.read()))
     except (Exception, KeyboardInterrupt) as exc:
         emit("result", subtype="error_during_execution", is_error=True, result=str(exc) or type(exc).__name__)
         return 1

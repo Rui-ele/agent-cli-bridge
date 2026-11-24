@@ -11,6 +11,7 @@ if sys.version_info < (3, 10):
 import argparse
 import asyncio
 import base64
+from collections import defaultdict, deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -174,8 +175,26 @@ def safe_file(path):
     return path.resolve()
 
 
+def claude_project_name(project):
+    # Claude Code computes both its 200-character prefix and hash over JavaScript UTF-16 units.
+    data = str(project).encode("utf-16-le", errors="surrogatepass")
+    units = [n for n, in struct.iter_unpack("<H", data)]
+    name = re.sub(r"[^a-zA-Z0-9]", "-", "".join(map(chr, units)))
+    if len(name) <= 200:
+        return name
+    value = 0
+    for unit in units:
+        value = (31 * value + unit) & 0xffffffff
+    value = abs(value if value < 0x80000000 else value - 0x100000000)
+    digits = ""
+    while value:
+        value, digit = divmod(value, 36)
+        digits = "0123456789abcdefghijklmnopqrstuvwxyz"[digit] + digits
+    return name[:200] + "-" + (digits or "0")
+
+
 def session_path(project, selector):
-    folder = home() / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(project))
+    folder = home() / "projects" / claude_project_name(project)
     if selector:
         candidate = Path(selector).expanduser()
         if candidate.is_absolute() or "/" in selector or candidate.suffix or candidate.is_file():
@@ -213,25 +232,56 @@ def codex_session_path(selector):
 
 def load_codex_session(path, tier):
     # Completed UI items distinguish real user turns from injected workspace instructions.
-    messages, turn, modern_roles = [], [], set()
+    turns, turn = [], []
+    unpaired = defaultdict(deque)
+    explicit_turn = False
 
     def finish_turn():
-        # Rollouts may repeat a message in both formats. Shell items do not replace dialogue.
-        messages.extend((role, blocks) for role, blocks, legacy in turn if not legacy or role not in modern_roles)
+        if explicit_turn and any(role == "user" for role, _ in turn):
+            turns.append(turn.copy())
+        else:
+            # Count user turns conservatively: empty/control-only tasks cannot absorb a rollback.
+            # In older rollouts without task_started, each user message begins a turn.
+            for role, blocks in turn:
+                if role == "user" or not turns:
+                    turns.append([])
+                turns[-1].append((role, blocks))
         turn.clear()
-        modern_roles.clear()
+        unpaired.clear()
+
+    def dialogue(role, blocks, legacy):
+        # Preserve the first position and pair occurrences one-to-one across the two formats.
+        message = "".join(b["text"] for b in blocks)
+        other = unpaired[role, message, not legacy]
+        if other:
+            index = other.popleft()
+            if not legacy:
+                turn[index] = (role, blocks)
+        else:
+            unpaired[role, message, legacy].append(len(turn))
+            turn.append((role, blocks))
 
     for row in records(path):
         event = row.get("payload")
         if row.get("type") != "event_msg" or not isinstance(event, dict):
             continue
         kind = event.get("type")
-        if kind == "task_started":
+        if kind in ("task_started", "turn_started"):
             finish_turn()
+            explicit_turn = True
+            continue
+        if kind == "thread_rolled_back":
+            finish_turn()
+            explicit_turn = False
+            count = event.get("num_turns")
+            if type(count) is not int or count < 0:
+                raise Blocked("invalid_codex_rollback")
+            if count:
+                del turns[-count:]
             continue
         if kind in ("user_message", "agent_message") and isinstance(event.get("message"), str):
             role = "user" if kind == "user_message" else "assistant"
-            turn.append((role, [{"type": "text", "text": event["message"]}], True))
+            dialogue(role, [{"type": "text", "text": event["message"]}], True)
             continue
         item = event.get("item")
         if kind != "item_completed" or not isinstance(item, dict):
@@ -246,8 +296,7 @@ def load_codex_session(path, tier):
                       if isinstance(part, dict) and part.get("type") in ("text", "Text")
                       and isinstance(part.get("text"), str) and part["text"].strip()]
             if blocks:
-                modern_roles.add(role)
-                turn.append((role, blocks, False))
+                dialogue(role, blocks, False)
         elif kind == "CommandExecution" and tier != "scoped":
             argv, output = item.get("command"), item.get("aggregated_output")
             if (isinstance(argv, list) and argv and all(isinstance(arg, str) for arg in argv)
@@ -256,8 +305,11 @@ def load_codex_session(path, tier):
                 turn.append(("assistant", [
                     {"type": "tool_use", "name": "shell", "input": {"command": command}, "id": item.get("id")},
                     {"type": "tool_result", "content": output if isinstance(output, str) else "",
-                     "tool_use_id": item.get("id")}], False))
+                     "tool_use_id": item.get("id")}]))
     finish_turn()
+    if tier == "scoped":
+        turns = turns[-3:]
+    messages = [message for history in turns for message in history]
     if not any(role == "user" for role, _ in messages):
         raise Blocked("codex_session_has_no_conversation")
     return messages
@@ -389,7 +441,7 @@ def package(task, messages, includes, tier, mode, size, caller="claude"):
             snippet = clean(f.read(2000))
         pieces.append(Piece("include", f"[文件] {clean(str(p))}\n" + "\n".join(snippet.splitlines()[:5])))
     if tier != "none":
-        if tier == "scoped":
+        if tier == "scoped" and caller != "codex":
             rounds = [i for i, (r, bs) in enumerate(messages) if r == "user" and
                       any(b.get("type") == "text" and REMINDER.sub("", b.get("text", "")).strip()
                           for b in bs)]
@@ -1055,6 +1107,12 @@ class Driver:
     def translate(self, raw, pending):
         yield self.decode(raw)
 
+    def update_usage(self, previous, reported):
+        return reported
+
+    def waiting_for_input(self, run_dir):
+        return False
+
     def status_events(self, path):
         return (self.decode(raw) for raw in recent_events(path))
 
@@ -1320,10 +1378,12 @@ class AgyPrint(AgyDriver):
 SEATBELT = Path("/usr/bin/sandbox-exec")
 
 
-def seatbelt_profile(mode, cwd, writable, data_dirs, regexes=()):
-    roots = [*data_dirs, "/private/var/folders", "/dev"]
-    if os.getenv("TMPDIR"):
-        roots.append(os.environ["TMPDIR"])
+def seatbelt_profile(mode, cwd, writable, data_dirs, regexes=(), *, shared_temp=True):
+    roots = [*data_dirs, "/dev"]
+    if shared_temp:
+        roots.append("/private/var/folders")
+        if os.getenv("TMPDIR"):
+            roots.append(os.environ["TMPDIR"])
     if mode == "write":
         roots.extend((cwd, *writable))
     # Agents can read directly without client filesystem RPCs. This profile confines writes only.
@@ -1369,7 +1429,7 @@ class ClaudePrint(SeatbeltDriver):
     backend = "print"
     relay_signals = True
     # Leave host settings, skills, hooks, tools and other delegation runs read-only.
-    state_dirs = ("projects", "sessions", "session-env", "shell-snapshots", "state", "cache",
+    state_dirs = ("sessions", "session-env", "shell-snapshots", "state", "cache",
                   "file-history", "todos", "plans", "debug", "statsig", "telemetry", "backups",
                   "paste-cache", "ide")
 
@@ -1386,20 +1446,39 @@ class ClaudePrint(SeatbeltDriver):
             if key in ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT") or key.startswith(
                     ("CLAUDE_CODE_", "CLAUDE_AGENT_SDK_", "CLAUDE_PREVIEW_")):
                 del env[key]
+        if writable:
+            env["CLAUDE_CODE_TMPDIR"] = env["TMPDIR"]
         return env
 
-    def profile_text(self, mode, cwd, writable):
+    def profile_text(self, args, cwd, run_dir, writable):
         config = Path(cwd) / Path(os.getenv("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
-        dirs = [config / name for name in self.state_dirs] + [f"/private/tmp/claude-{os.getuid()}"]
+        dirs = [config / name for name in self.state_dirs]
+        dirs.append(config / "projects" / claude_project_name(cwd))
+        if writable:
+            dirs.append(writable[-1])
         # Quote the literal home path for the regex before seatbelt_profile quotes the string.
         escapes = str.maketrans({c: "\\" + c for c in r"\.^$*+?()[]{}|"})
         home_pattern = str(Path.home().resolve()).translate(escapes)
-        patterns = [r"^/private/tmp/claude-[0-9a-f]+-cwd$", "^" + home_pattern + r"/\.claude\.json"]
-        return seatbelt_profile(mode, cwd, writable, dirs, patterns)
+        # Claude needs its shared user state and the sibling files used for atomic updates.
+        patterns = ["^" + home_pattern + r"/\.claude\.json(\.[^/]*)?$"]
+        rules = seatbelt_profile(args.mode, cwd, writable, dirs, patterns, shared_temp=False)
+        protected = [home() / "delegate-log.jsonl"]
+        if args.mode == "ro" and writable:
+            scratch = dumps(str(writable[-1]))
+            # Keep every receipt and directory entry protected, including the scratch root itself.
+            rules += (f"(deny file-write* (require-all (subpath {dumps(str(run_dir.parent))}) "
+                      f"(require-not (subpath {scratch}))))\n"
+                      f"(deny file-write* (literal {scratch}))\n")
+        else:
+            protected.append(run_dir.parent)
+        protected.extend(getattr(args, "source_paths", ()))
+        for root in protected:
+            rules += f"(deny file-write* (subpath {dumps(str(root.resolve()))}))\n"
+        return rules
 
     def command(self, args, cwd, run_dir, writable):
         profile = run_dir / "sandbox.sb"
-        save_text(profile, self.profile_text(args.mode, cwd, writable))
+        save_text(profile, self.profile_text(args, cwd, run_dir, writable))
         # Seatbelt already confines writes. A nested sandbox is redundant; conflicts are untested.
         cmd = [str(SEATBELT), "-f", str(profile), "claude", "-p", "--model", args.model,
                "--output-format", "stream-json", "--verbose", "--json-schema",
@@ -1421,19 +1500,23 @@ class ClaudePrint(SeatbeltDriver):
             cmd += ["--resume", args.resume]
         return cmd
 
-    def decode(self, raw):
-        if raw.get("type") == "system" and raw.get("subtype") == "init":
-            return WorkerEvent(session=raw.get("session_id") or UNSET)
-        if raw.get("type") != "result":
-            return WorkerEvent()
+    @staticmethod
+    def usage(raw):
         counts = raw.get("usage") or {}
         usage = {k: counts.get(k, 0) for k in ("input_tokens", "output_tokens",
                  "cache_creation_input_tokens", "cache_read_input_tokens")}
         usage.update(total_tokens=sum(usage.values()), cost_usd=raw.get("total_cost_usd"),
                      actual_models=list(raw.get("modelUsage") or {}))
+        return usage
+
+    def decode(self, raw):
+        if raw.get("type") == "system" and raw.get("subtype") == "init":
+            return WorkerEvent(session=raw.get("session_id") or UNSET)
+        if raw.get("type") != "result":
+            return WorkerEvent()
         reply = raw.get("structured_output")
         failed = raw.get("is_error") or raw.get("subtype") != "success"
-        return WorkerEvent(session=raw.get("session_id") or UNSET, usage=usage,
+        return WorkerEvent(session=raw.get("session_id") or UNSET, usage=self.usage(raw),
                            reply=dumps(reply) if reply is not None else raw.get("result", ""),
                            error=(raw.get("result") or "claude_error") if failed else UNSET,
                            permission_denials=len(raw.get("permission_denials") or []))
@@ -1499,24 +1582,54 @@ class ClaudePrint(SeatbeltDriver):
 class ClaudeSDK(ClaudePrint):
     backend = "sdk"
 
+    def waiting_for_input(self, run_dir):
+        control = run_dir / "sdk-control"
+        return (control / "idle.json").is_file() or any(control.glob("pending-*.json"))
+
+    def decode(self, raw):
+        if raw.get("type") == "sdk.turn_result":
+            return WorkerEvent(usage=self.usage(raw), session=raw.get("session_id") or UNSET)
+        event = super().decode(raw)
+        # The terminal frame may repeat all turns or have no usage after an exception.
+        event.usage = UNSET
+        return event
+
+    def update_usage(self, previous, reported):
+        if previous:
+            for field in previous:
+                if field.endswith("_tokens"):
+                    reported[field] += previous[field]
+            if reported["cost_usd"] is None:
+                reported["cost_usd"] = previous["cost_usd"]
+            reported["actual_models"] = list(dict.fromkeys(previous["actual_models"] + reported["actual_models"]))
+        return reported
+
+    def interpreter(self):
+        # Preserve the final symlink: a venv selects its site-packages by the invoked path.
+        python = os.path.abspath(os.path.expanduser(os.getenv("CC_DELEGATE_SDK_PYTHON") or sys.executable))
+        if not os.path.isfile(python) or not os.access(python, os.X_OK):
+            raise WorkerLaunchError("CC_DELEGATE_SDK_PYTHON must name an executable Python interpreter")
+        try:
+            probe = subprocess.run([python, "-I", "-B", "-c", "import claude_agent_sdk; print('sdk-ready')"],
+                                   cwd=Path(__file__).resolve().parent, stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise WorkerLaunchError("CC_DELEGATE_SDK_PYTHON failed the SDK import check") from exc
+        if probe.returncode or probe.stdout.splitlines()[-1:] != [b"sdk-ready"]:
+            raise WorkerLaunchError("CC_DELEGATE_SDK_PYTHON cannot import claude_agent_sdk in isolated mode")
+        return python
+
     def command(self, args, cwd, run_dir, writable):
-        python = os.getenv("CC_DELEGATE_SDK_PYTHON") or sys.executable
         cli = shutil.which(self.executable)
         profile = run_dir / "sandbox.sb"
-        rules = self.profile_text(args.mode, cwd, writable)
-        # The CLI must never write its own approvals, even if the run home is under TMPDIR.
-        project = Path(args.project_dir).expanduser().resolve()
-        repository = git(project, "rev-parse", "--show-toplevel", check=False).strip()
-        protected = [run_dir.parent, home() / "delegate-log.jsonl", Path(repository) if repository else project]
-        for root in protected:
-            rules += f"(deny file-write* (subpath {dumps(str(root.resolve()))}))\n"
-        save_text(profile, rules)
+        save_text(profile, self.profile_text(args, cwd, run_dir, writable))
         launcher = run_dir / "claude-sdk-cli"
         save_text(launcher, "#!/bin/sh\nexec " + shlex.join([str(SEATBELT), "-f", str(profile), cli]) + ' "$@"\n')
         launcher.chmod(0o700)
         (run_dir / "sdk-control").mkdir(mode=0o700)
         worker = Path(__file__).with_name("claude_sdk_worker.py").resolve()
-        cmd = [python, "-I", "-B", str(worker), "--run-dir", str(run_dir), "--cwd", str(cwd),
+        cmd = [args.sdk_python, "-I", "-B", str(worker), "--supervisor-pid", str(os.getpid()),
+               "--run-dir", str(run_dir), "--cwd", str(cwd),
                "--cli-path", str(launcher), "--model", args.model, "--mode", args.mode,
                "--approval", args.approval or "auto"]
         if args.keep_open:
@@ -1635,6 +1748,7 @@ class WorkerEvents:
         self.usage = None
         self.reply = ""
         self.error = None
+        self.saw_result = False
         self.item_ids = set()
         self.pending_tools = {}
         self.permission_denials = None
@@ -1659,6 +1773,8 @@ class WorkerEvents:
     def observe(self, raw):
         if not isinstance(raw, dict):
             return
+        if raw.get("type") == "result":
+            self.saw_result = True
         warning = None
         for event in self.driver.translate(raw, self.pending_tools):
             warning = self.apply(event) or warning
@@ -1667,7 +1783,9 @@ class WorkerEvents:
     def apply(self, event):
         if event.permission_denials is not None:
             self.permission_denials = event.permission_denials
-        for name in ("session", "usage", "reply", "error"):
+        if event.usage is not UNSET:
+            self.usage = self.driver.update_usage(self.usage, event.usage)
+        for name in ("session", "reply", "error"):
             value = getattr(event, name)
             if value is not UNSET:
                 setattr(self, name, value)
@@ -1825,7 +1943,7 @@ def net_received(chunk):
     return False
 
 
-def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
+def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None, pass_fds=()):
     buf = memoryview(events.driver.encode_prompt(prompt).encode())
     roots = [run_dir] + ([cwd] if meta["worktree"] else [])
     prev = mtimes(roots)
@@ -1853,7 +1971,8 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
 
         try:
             proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, start_new_session=True, bufsize=0, env=env)
+                                    stderr=subprocess.PIPE, start_new_session=True, bufsize=0, env=env,
+                                    pass_fds=pass_fds)
         except OSError as error:
             raise WorkerLaunchError(str(error)) from error
         last_activity = last_scan = time.monotonic()
@@ -1967,6 +2086,9 @@ def supervise(cmd, cwd, run_dir, prompt, meta, stall, events, finish, env=None):
                             last_activity = current
                     if not stall:
                         continue
+                    if events.driver.waiting_for_input(run_dir):
+                        last_activity = current
+                        continue
                     if current - last_scan >= min(stall / 4, 2) or current - last_activity >= stall:
                         snapshot = mtimes(roots)
                         if prev != snapshot:
@@ -2021,9 +2143,9 @@ def raw_stdout(run_dir):
     return "\n".join(lines)
 
 
-def git(cwd, *argv, check=True):
+def git(cwd, *argv, check=True, env=None):
     p = subprocess.run(["git", "-C", str(cwd), *argv], stdin=subprocess.DEVNULL,
-                       capture_output=True, start_new_session=True)
+                       capture_output=True, start_new_session=True, env=env)
     if p.returncode and check:
         raise Blocked(f"git {argv[0]} failed ({p.returncode})")
     return os.fsdecode(p.stdout) if not p.returncode else ""
@@ -2123,8 +2245,44 @@ def breaches(before, after, landings, own_ref=None):
     return sorted(out)
 
 
-# Git config inside the worker's checkout is worker-controlled; never let it run programs.
-UNTRUSTED = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+@contextmanager
+def clone_view(repo, worktree):
+    """Give status, revision walks and fetch's upload-pack the same trusted Git directory."""
+    sidecar = worktree.parent / (".git-" + worktree.name)
+    if sidecar.is_symlink() or worktree.is_symlink() or not worktree.is_dir():
+        raise Blocked("unsafe_clone_path")
+    # Git always reads repository config, including arbitrary includes and named filters.
+    # Expose only data files through a private gitdir, never config, hooks or commondir.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_ALLOW_PROTOCOL="file",
+               GIT_OPTIONAL_LOCKS="0", GIT_NO_REPLACE_OBJECTS="1")
+    with tempfile.TemporaryDirectory(dir=home() / "delegate-runs") as tmp:
+        view = Path(tmp)
+        fmt = git(repo, "rev-parse", "--show-object-format").rstrip("\n")
+        config = "[core]\n\tbare = true\n"
+        extensions = []
+        if fmt == "sha256":
+            extensions.append("objectFormat = sha256")
+        elif fmt != "sha1":
+            raise Blocked("unknown_git_object_format")
+        if (sidecar / "reftable").is_dir():
+            extensions.append("refStorage = reftable")
+        if extensions:
+            config += "\trepositoryFormatVersion = 1\n[extensions]\n\t" + "\n\t".join(extensions) + "\n"
+        (view / "config").write_text(config)
+        if (sidecar / "HEAD").is_symlink() or not (sidecar / "HEAD").is_file():
+            raise Blocked("invalid_clone_head")
+        shutil.copyfile(sidecar / "HEAD", view / "HEAD")
+        for name in ("objects", "refs", "logs", "index", "packed-refs", "reftable", "shallow"):
+            if (sidecar / name).exists():
+                (view / name).symlink_to(sidecar / name)
+        for index in sidecar.glob("sharedindex.*"):
+            (view / index.name).symlink_to(index)
+
+        def inspect(*argv):
+            return git(view, f"--git-dir={view}", f"--work-tree={worktree}", *argv, env=env)
+
+        yield view, inspect, env
 
 
 def status_paths(status):
@@ -2137,17 +2295,23 @@ def status_paths(status):
                 yield next(it)
 
 
-def diff_info(worktree, base):
-    paths = set(status_paths(git(worktree, *UNTRUSTED, "status", "--porcelain=v1", "-z", "--untracked-files=all")))
+def diff_info(inspect, base):
+    status = inspect("status", "--ignore-submodules=all", "--porcelain=v1", "-z", "--untracked-files=all")
+    paths = set(status_paths(status))
     common = ("diff", "--no-ext-diff", "--no-textconv", "--no-renames")
-    changed = git(worktree, *UNTRUSTED, *common, "--name-only", "-z", base, "--")
-    paths.update(filter(None, changed.split("\0")))
-    stats = []
-    for row in git(worktree, *UNTRUSTED, *common, "--numstat", "-z", base, "--").split("\0"):
-        if row:
-            added, removed, name = row.split("\t", 2)
-            stats.append({"path": name, "added": added, "deleted": removed})
-    return sorted(paths), stats
+    rows = inspect(*common, "--ignore-submodules=all", "--numstat", "-z", base, "--").split("\0")
+    # A cached diff can report gitlink changes without visiting the nested repository.
+    raw = iter(inspect(*common, "--cached", "--ignore-submodules=none", "--raw", "-z", base, "--").split("\0"))
+    links = {name for modes, name in zip(raw, raw) if "160000" in modes.removeprefix(":").split()[:2]}
+    if links:
+        cached = inspect(*common, "--cached", "--ignore-submodules=none", "--numstat", "-z", base, "--")
+        rows.extend(row for row in cached.split("\0") if row and row.split("\t", 2)[2] in links)
+    stats = {}
+    for row in filter(None, rows):
+        added, removed, name = row.split("\t", 2)
+        paths.add(name)
+        stats[name] = {"path": name, "added": added, "deleted": removed}
+    return sorted(paths), [stats[name] for name in sorted(stats)]
 
 
 def checkout_state(repo):
@@ -2325,7 +2489,9 @@ def worker_attempt(driver, args, cwd, d, writable, repo, prompt, meta, finish):
         # Cleaning up a failed startup must leave the next attempt interruptible.
         with (run_interrupts() if driver.fallback_backend else nullcontext(finish)) as finish_attempt:
             rc, stalled = supervise(cmd, cwd, d, prompt, meta, stall, events, finish_attempt,
-                                    driver.environment(writable))
+                                    driver.environment(writable), getattr(args, "sdk_fds", ()))
+        if driver.backend == "sdk" and not events.saw_result and not events.error:
+            events.error = "sdk_worker_missing_terminal_result"
         if (driver.fallback_backend and rc == driver.unavailable_exit
                 and not stalled and not (d / "cancel.requested").exists()):
             # Keep the failed startup out of the next attempt's raw-output fallback.
@@ -2391,6 +2557,8 @@ def run(args, driver, quiet=False):
             if not project.is_dir():
                 raise Blocked("project_dir_missing")
             driver.check_available()
+            if driver.backend == "sdk":
+                args.sdk_python = driver.interpreter()
             messages = []
             if args.caller == "claude":
                 path = session_path(project, args.cc_session)
@@ -2408,13 +2576,17 @@ def run(args, driver, quiet=False):
             meta.update(package_tokens_est=math.ceil(len(prompt)/3), redactions=count)
             save_text(d / "package.md", prompt)
             save_json(d / "schema.json", SCHEMA)
-            repo = git(project, "rev-parse", "--show-toplevel", check=False).rstrip("\n")
+            repo = git(project, "rev-parse", "--show-toplevel", check=False).removesuffix("\n")
             common = None
             cwd = project
             if repo:
-                common = Path(git(project, "rev-parse", "--path-format=absolute", "--git-common-dir").rstrip("\n"))
+                common = Path(git(project, "rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix("\n"))
                 meta["base_sha"] = git(project, "rev-parse", "--verify", "HEAD", check=False).strip() or None
             writable = ()
+            if isinstance(driver, ClaudePrint):
+                args.source_paths = (Path(repo), common) if repo else (project,)
+                if args.mode == "ro":
+                    writable = (Path(stack.enter_context(tempfile.TemporaryDirectory(dir=d, prefix="tmp-"))),)
             if args.mode == "write":
                 if not repo or not meta["base_sha"]:
                     raise Blocked("write_requires_git_head")
@@ -2457,6 +2629,14 @@ def run(args, driver, quiet=False):
                     isolated_checkout(Path(repo), cwd, gitdir, f"delegate/{task_id}", meta["base_sha"])
                     worktree = cwd
                     meta["worktree"] = str(cwd)
+            if driver.backend == "sdk" and not args.dry_run:
+                # Record the clone before allowing orphan recovery. Both processes keep this
+                # flock until exit so prune cannot race SDK disconnect or result publication.
+                save_json(d / "meta.json", meta)
+                (d / ".result.lock").touch()
+                lease = stack.enter_context((d / ".sdk-active.lock").open("xb"))
+                fcntl.flock(lease, fcntl.LOCK_EX)
+                args.sdk_fds = (lease.fileno(),)
             attempt = worker_attempt(driver, args, cwd, d, writable, Path(repo) if repo else None,
                                      prompt, meta, finish)
             if attempt is None:
@@ -2518,12 +2698,15 @@ def run(args, driver, quiet=False):
                         if meta["status"] == "ok":
                             meta["status"] = "partial"
                     # Take whatever the worker left checked out, even if it switched branches.
-                    new = git(worktree, *UNTRUSTED, "rev-list", "-1", f"{meta['base_sha']}..HEAD", "--").strip()
-                    if new:
-                        git(Path(repo), *UNTRUSTED, "fetch", "-q", "--no-tags", str(worktree), f"+{new}:{ref}")
-                        meta["branch"] = branch
-                        record_landing(common, task_id, ref, after["refs"].get(ref), new)
-                    meta["changed_files"], meta["diff_stat"] = diff_info(worktree, meta["base_sha"])
+                    with clone_view(Path(repo), worktree) as (view, inspect, env):
+                        new = inspect("rev-list", "-1", f"{meta['base_sha']}..HEAD", "--").strip()
+                        if new:
+                            git(Path(repo), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                                "fetch", "-q", "--no-tags",
+                                "--no-recurse-submodules", str(view), f"+{new}:{ref}", env=env)
+                            meta["branch"] = branch
+                            record_landing(common, task_id, ref, after["refs"].get(ref), new)
+                        meta["changed_files"], meta["diff_stat"] = diff_info(inspect, meta["base_sha"])
                 except (OSError, Blocked) as error:
                     publish_error = error
             # Accept cancellation during fetch, then serialize the landing decision with result publication.
@@ -2630,6 +2813,8 @@ def sdk_request(directory, action, timeout=10, **params):
     try:
         while not ack.exists():
             if (directory / "result.json").exists():
+                if ack.exists():
+                    break
                 raise Blocked("task_finished_without_ack")
             if time.monotonic() >= deadline:
                 try:
@@ -2894,14 +3079,24 @@ def prune_clone(repo, task_id, worktree, dry_run, counts, unsafe):
         return
     present = [p for p in paths if p.is_dir()]
     if clone in present or paths[1] in present:
-        clone_git = ("--no-optional-locks", f"--git-dir={paths[1]}", f"--work-tree={clone}")
         try:
-            if git(clone, *clone_git, "status", "--porcelain", "--untracked-files=all"):
-                return "uncommitted_changes"
-            tips = git(repo, "for-each-ref", "--format=%(objectname)", "refs/heads").splitlines()
-            if git(clone, *clone_git, "rev-list", "-1", "HEAD", "--all", "--reflog", "--not", *tips):
-                return "unique_commits"
-        except Blocked:
+            linked = paths[1] / "worktrees"
+            if linked.is_symlink() or (linked.exists() and any(linked.iterdir())):
+                return "linked_worktrees"
+            with clone_view(repo, clone) as (_, inspect, _env):
+                if (inspect("status", "--porcelain", "--ignore-submodules=all", "--untracked-files=all")
+                        or inspect("diff", "--cached", "--name-only", "--ignore-submodules=none", "HEAD", "--")):
+                    return "uncommitted_changes"
+                # Entering a populated submodule would load its own untrusted config.
+                for entry in inspect("ls-files", "--stage", "-z").split("\0"):
+                    if entry.startswith("160000 "):
+                        sub = clone / entry.split("\t", 1)[1]
+                        if sub.is_symlink() or not sub.is_dir() or any(sub.iterdir()):
+                            return "submodule_checkout"
+                tips = git(repo, "for-each-ref", "--format=%(objectname)", "refs/heads").splitlines()
+                if inspect("rev-list", "-1", "HEAD", "--all", "--reflog", "--not", *tips):
+                    return "unique_commits"
+        except (Blocked, OSError):
             return "inspection_failed"
     if not dry_run:
         for path in present:
@@ -2913,16 +3108,26 @@ def prune_run(d, cutoff, dry_run, counts, kept, kept_clones, unsafe):
     with ExitStack() as stack:
         result = d / "result.json"
         metadata = d / "meta.json"
-        if (not TASK_ID.fullmatch(d.name) or d.is_symlink() or not result.is_file() or result.is_symlink()
+        if (not TASK_ID.fullmatch(d.name) or d.is_symlink() or result.is_symlink()
+                or not (result.is_file() or (d / ".sdk-active.lock").is_file())
                 or not metadata.is_file() or metadata.is_symlink() or (d / ".result.lock").is_symlink()
                 or not lock(stack, d / ".result.lock", create=not dry_run)):
             return False
         meta = json.loads(metadata.read_text())
-        if not isinstance(meta, dict) or meta["task_id"] != d.name or meta["status"] == "running":
+        if not isinstance(meta, dict) or meta["task_id"] != d.name:
             return False
-        finished = datetime.fromisoformat(meta["finished_at"])
-        if finished.tzinfo is None or finished.timestamp() >= cutoff:
-            return False
+        if result.is_file():
+            finished = datetime.fromisoformat(meta["finished_at"])
+            if meta["status"] == "running" or finished.tzinfo is None or finished.timestamp() >= cutoff:
+                return False
+        else:
+            lease = d / ".sdk-active.lock"
+            if (result.exists() or meta.get("backend") != "sdk" or not meta.get("worker_pid")
+                    or not lease.is_file() or lease.is_symlink() or not lock(stack, lease, create=False)):
+                return False
+            # A crashed supervisor cannot timestamp its exit. Age the run by its last recorded activity.
+            if max(p.stat().st_mtime for p in (metadata, d / "events.jsonl") if p.is_file()) >= cutoff:
+                return False
         project = Path(meta["project_dir"])
         worktree = meta["worktree"]
         if not project.is_absolute() or (worktree is not None and not isinstance(worktree, str)):

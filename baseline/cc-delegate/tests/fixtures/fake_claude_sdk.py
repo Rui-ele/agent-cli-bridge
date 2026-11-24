@@ -112,6 +112,8 @@ class ClaudeSDKClient:
             consumed = [first_id]
             first, self.first = self.first, False
             scenario = os.environ.get("SDK_SCENARIO", "normal")
+            if not first and scenario == "fail_followup":
+                raise RuntimeError("simulated follow-up failure")
             yield StreamEvent({"type": "content_block_delta", "index": 0,
                                "delta": {"type": "text_delta", "text": "live SDK delta"}}, self.session)
             if first and scenario == "stream":

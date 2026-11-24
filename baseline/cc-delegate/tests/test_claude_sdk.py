@@ -88,8 +88,9 @@ class ClaudeSdkCase(unittest.TestCase):
         self.assertIn(str(self.sandbox), launcher.read_text())
         self.assertIn(str(profile), launcher.read_text())
         self.assertIn(str(self.claude), launcher.read_text())
-        for location in (self.project, directory.parent):
-            self.assertIn(f"(deny file-write* (subpath {json.dumps(str(location))}))", profile.read_text())
+        self.assertIn(f"(deny file-write* (subpath {json.dumps(str(self.project))}))", profile.read_text())
+        self.assertIn(f"(deny file-write* (require-all (subpath {json.dumps(str(directory.parent))}) "
+                      "(require-not (subpath ", profile.read_text())
         _, cc_result = self.run_task("--caller", "claude")
         self.assertEqual(cc_result["backend"], "print")
         self.assertTrue((self.root / "print-trace").is_file())
@@ -99,12 +100,75 @@ class ClaudeSdkCase(unittest.TestCase):
         cc.git(self.project, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                "commit", "--allow-empty", "-qm", "base")
         cc.git(self.project, "branch", "feature")
-        with patch.dict(os.environ, {"SDK_SCENARIO": "write"}):
+        with patch.dict(os.environ, {"SDK_SCENARIO": "write",
+                                     "CC_DELEGATE_SDK_PYTHON": os.path.relpath(self.python)}):
             directory, result = self.run_task("--mode", "write", "--onto", "feature")
         self.assertEqual((result["status"], result["changed_files"]), ("ok", ["answer.txt"]))
         self.assertEqual(cc.git(self.project, "show", "feature:answer.txt"), "fixture answer\n")
         self.assertFalse((self.project / "answer.txt").exists())
         self.assertIn(str(result["worktree"]), (directory / "sandbox.sb").read_text())
+
+    def test_interpreter_errors_fail_before_cloning(self):
+        nonexec = self.bin / "not-executable"
+        nonexec.touch()
+        (self.modules / "claude_agent_sdk.py").write_text("raise ImportError('fixture')\n")
+        for path, reason in [(self.bin / "missing", "executable"), (nonexec, "executable"),
+                             (self.python, "cannot import")]:
+            with self.subTest(path=path), patch.dict(os.environ, {"CC_DELEGATE_SDK_PYTHON": str(path)}):
+                _, result = self.run_task("--mode", "write", expected=1)
+                self.assertEqual(result["status"], "failed")
+                self.assertIn(reason, result["reason"])
+                self.assertIsNone(result["worktree"])
+                self.assertFalse(cc.clone_root(self.project).exists())
+
+    def test_sdk_zero_exit_without_terminal_frame(self):
+        self.python.write_text(self.python.read_text().replace(
+            "os.execv(", "if '-c' not in sys.argv: sys.exit(0)\nos.execv("))
+        _, result = self.run_task(expected=2)
+        self.assertEqual(result["status"], "outcome_unknown")
+        self.assertIn("sdk_worker_missing_terminal_result", result["summary"][0])
+
+    def test_final_ack_published_between_caller_checks(self):
+        directory = self.root / "run"
+        control = directory / "sdk-control"
+        control.mkdir(parents=True)
+        exists = Path.exists
+
+        def publish_then_finish(path):
+            if path.name.startswith("ack-") and not exists(path):
+                cc.save_json(path, {"ok": True, "status": "finished"})
+                cc.save_json(directory / "result.json", {"status": "ok"})
+                return False
+            return exists(path)
+
+        with patch.object(Path, "exists", publish_then_finish):
+            self.assertEqual(cc.sdk_request(directory, "finish")["status"], "finished")
+
+    def test_orphan_disconnects_and_prune_preserves_dirty_clone(self):
+        cc.git(self.project, "init", "-q", "-b", "main")
+        cc.git(self.project, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+               "commit", "--allow-empty", "-qm", "base")
+        with self.running("normal", "--keep-open", "--mode", "write") as (directory, proc):
+            self.wait_for((directory / "sdk-control/idle.json").is_file, proc)
+            tree = Path(json.loads((directory / "meta.json").read_text())["worktree"])
+            self.assertIn("runs=0", self.call("prune", "--older-than", "0"))
+            draft = tree / "draft"
+            draft.write_text("unsaved work")
+            proc.kill()
+            proc.wait(timeout=5)
+            end = time.monotonic() + 5
+            while time.monotonic() < end:
+                preview = self.call("prune", "--older-than", "0", "--dry-run")
+                if "uncommitted_changes" in preview:
+                    break
+                time.sleep(.05)
+            self.assertIn("uncommitted_changes", preview)
+            self.assertIn("disconnect", [e["event"] for e in self.events()])
+            self.assertIn("uncommitted_changes", self.call("prune", "--older-than", "0"))
+            self.assertEqual(draft.read_text(), "unsaved work")
+            draft.unlink()
+            self.assertIn("runs=1", self.call("prune", "--older-than", "0"))
+            self.assertFalse(directory.exists() or tree.exists())
 
     def test_sdk_failure_surfaces_without_switching_to_print(self):
         with patch.dict(os.environ, {"SDK_SCENARIO": "error"}):
@@ -254,6 +318,25 @@ class ClaudeSdkCase(unittest.TestCase):
             self.call("cancel", directory.name, "--wait", "2")
             self.finish(proc, expected=2)
             self.assertEqual(self.result(directory)["status"], "cancelled")
+            self.assertEqual(self.result(directory)["worker_usage"]["total_tokens"], 16)
+
+    def test_failed_followup_preserves_usage_and_idle_does_not_stall(self):
+        with self.running("fail_followup", "--keep-open", "--stall-seconds", "2") as (directory, proc):
+            self.wait_for((directory / "sdk-control/idle.json").is_file, proc)
+            time.sleep(2.7)
+            self.call("queue", directory.name, "--message", "second turn")
+            self.finish(proc, expected=2)
+            result = self.result(directory)
+            self.assertIn("simulated follow-up failure", " ".join(result["summary"]))
+            usage = result["worker_usage"]
+            self.assertEqual((usage["total_tokens"], usage["cost_usd"]), (16, 0.003))
+
+    def test_stall_timer_pauses_until_approval(self):
+        with self.running("approval", "--approval", "ask", "--stall-seconds", "2") as (directory, proc):
+            pending = self.wait_for(lambda: next((directory / "sdk-control").glob("pending-*.json"), None), proc)
+            time.sleep(2.7)
+            self.call("approve", directory.name, "--request-id", pending.stem.removeprefix("pending-"))
+            self.finish(proc)
 
     def approval(self, command, expected_behavior):
         with self.running("approval", "--approval", "ask") as (directory, proc):

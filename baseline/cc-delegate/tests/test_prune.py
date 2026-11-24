@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
+import shlex
 import unittest
 from unittest.mock import patch
 
@@ -127,6 +128,46 @@ class PruneCase(unittest.TestCase):
         cc.git(self.repo, "fetch", str(clone), f"HEAD:refs/heads/{branch}")
         result = self.prune()
         self.assertEqual((result["runs"], result["clones"], result["kept_branches"]), (1, 1, [branch]))
+
+    def test_prune_ignores_clone_filters_and_retains_dirty_work(self):
+        (self.repo / "draft").write_text("base")
+        cc.git(self.repo, "add", "draft")
+        cc.git(self.repo, "commit", "-qm", "track draft")
+        self.base = cc.git(self.repo, "rev-parse", "HEAD").strip()
+        d = self.make_run(clone=True)
+        clone = cc.clone_root(self.repo) / d.name
+        marker = self.root / "filter-ran"
+        cc.git(clone, "config", "filter.fixture.clean", "touch " + shlex.quote(str(marker)) + " && cat")
+        (clone / ".gitattributes").write_text("draft filter=fixture\n")
+        (clone / "draft").write_text("edit")
+        self.assertEqual(self.prune()["kept_clones"], [dict(task_id=d.name, reason="uncommitted_changes")])
+        self.assertFalse(marker.exists())
+
+    def test_prune_preserves_populated_and_staged_submodules(self):
+        cc.git(self.repo, "update-index", "--add", "--cacheinfo", f"160000,{self.base},nested")
+        cc.git(self.repo, "commit", "-qm", "track gitlink")
+        self.base = cc.git(self.repo, "rev-parse", "HEAD").strip()
+        populated = self.make_run(clone=True)
+        staged = self.make_run(clone=True)
+        area = cc.clone_root(self.repo)
+        (area / populated.name / "nested" / "draft").write_text("unsaved")
+        cc.git(area / staged.name, "rm", "--cached", "nested")
+        with cc.clone_view(self.repo, area / staged.name) as (_, inspect, _env):
+            paths, stats = cc.diff_info(inspect, self.base)
+        self.assertEqual(paths, ["nested"])
+        self.assertEqual(stats, [dict(path="nested", added="0", deleted="1")])
+        result = self.prune()
+        self.assertEqual(result["kept_clones"], [dict(task_id=populated.name, reason="submodule_checkout"),
+                                                dict(task_id=staged.name, reason="uncommitted_changes")])
+
+    def test_prune_preserves_linked_worktree_metadata(self):
+        d = self.make_run(clone=True)
+        clone = cc.clone_root(self.repo) / d.name
+        linked = self.root / "linked"
+        cc.git(clone, "worktree", "add", "-q", "--detach", str(linked))
+        cc.git(linked, "commit", "--allow-empty", "-qm", "detached work")
+        self.assertEqual(self.prune()["kept_clones"], [dict(task_id=d.name, reason="linked_worktrees")])
+        self.assertEqual(cc.git(linked, "log", "-1", "--format=%s").strip(), "detached work")
 
     def test_unsafe_paths_and_missing_repo(self):
         outside = self.make_run()

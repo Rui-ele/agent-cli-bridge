@@ -86,6 +86,8 @@ python3 -m venv ~/.local/share/cc-delegate/sdk-venv
 export CC_DELEGATE_SDK_PYTHON="$HOME/.local/share/cc-delegate/sdk-venv/bin/python"
 ```
 
+`CC_DELEGATE_SDK_PYTHON` 的相对路径从发起命令的目录解析。脚本在创建克隆前检查该解释器能否加载 SDK。
+
 SDK 复用本机已登录的 `claude`。`run` 在启动时输出 `task_id`。每个任务持有一个 `ClaudeSDKClient`，可以从另一个命令读取进度、发送消息和处理权限请求。需要由发起方处理工具审批时加 `--approval ask`，用 `status` 查看待审批工具、输入和请求 ID，再用 `approve` 或 `deny` 回答。写入继续受独立克隆和 macOS Seatbelt 约束。
 
 要在看过第一轮结果后再决定追问什么，给 `run` 加 `--keep-open`。当 `status` 显示 `state="idle"` 和本轮摘要时，可以用 `queue` 开下一轮，也可以用 `finish` 交付。期间客户端、任务名额和写入克隆持续保留。每轮结果记在任务目录的 `events.jsonl` 中，最终报告取最后一轮，分支交付包含整个任务的提交。中断会停止当前轮，已执行的工具操作仍然保留。结束后再接着改，用 `--resume <worker_session_id>` 恢复对话，并用原目标分支 `--onto` 或上次结果 `--base` 选择代码起点。
@@ -98,6 +100,7 @@ Codex 默认只发送任务和显式指定的文件摘录。要带当前对话�
 
 请在用于工作材料之前读完这一节。
 
+- 同一系统用户下的其他会话也能凭 `task_id` 控制任务。
 - **发出去的上下文**：默认 `--context none`，只发任务文本和固定规则。`--include FILE` 只附上文件的路径和开头几行，接单方需要时会自己去读全文。由 CC 发起时，显式用 `--context scoped|session|full` 可带上 CC 对话，默认选该项目最新的 CC 会话。由 Codex 发起时，按上节选取 Codex 会话。两者打包前都会脱敏常见的密钥格式，普通业务内容会保留。
 - **只读和写入**：`--mode ro` 不允许接单方改文件。`--mode write` 在项目旁边的 `../.wt-delegate/<task_id>` 建一个独立克隆，接单方只在克隆里改，你的工作区和分支不会被直接改动。结束后，脚本把提交取回主仓库的 `delegate/<task_id>` 分支；加了 `--onto <已有功能分支>` 时，还会把该分支快进到这个提交。不能是快进、该分支在别的 worktree 里检出、或者 `main`/`master` 时，脚本拒绝移动分支。回执里给出 `rollback` 回退命令。
 - **沙箱只管写，不管读和联网**：接单方能读到你账号能读的所有文件，也能联网。含密钥或凭据的仓库，建议只交给你信任的接单方，或者不要委托。
@@ -109,6 +112,8 @@ Codex 默认只发送任务和显式指定的文件摘录。要带当前对话�
   - 写入任务另有 `../.wt-delegate/` 下的克隆，以及主仓库里的 `delegate/<task_id>` 分支。
 
   用 `prune --dry-run` 查看可以清理的内容，确认后再去掉 `--dry-run`。默认只清结束超过 7 天的；有未提交改动、或有未合并提交的克隆和分支会保留。有写入任务在跑时不要清理。
+
+  SDK 监督进程异常退出时，worker 会断开会话。新建的 SDK 任务在两端都退出后可以按最后活动时间清理，仍按相同规则保留克隆中的工作。
 
 ## 常用命令
 
