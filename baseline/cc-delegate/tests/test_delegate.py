@@ -237,6 +237,7 @@ class DelegateCase(unittest.TestCase):
                                       "CC_DELEGATE_HOME": str(self.profile / ".claude"),
                                       "CODEX_HOME": str(self.profile / ".codex"),
                                       "CC_DELEGATE_CODEX_BACKEND": "exec",
+                                      "CC_DELEGATE_AGY_FALLBACK": "0",
                                       "GIT_CEILING_DIRECTORIES": str(self.root),
                                       "GIT_CONFIG_NOSYSTEM": "1", "TMPDIR": str(self.root)})
         env.start()
@@ -258,8 +259,7 @@ class DelegateCase(unittest.TestCase):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             code = cc.main(["run", "--to", worker, "--model", "synthetic", "--cc-session",
-                            str(self.session), "--project-dir", str(self.project), "--task", "验收", *args,
-                            *(["--no-fallback"] if worker == "agy" and "--fallback" not in args else [])])
+                            str(self.session), "--project-dir", str(self.project), "--task", "验收", *args])
         self.assertEqual(expected, code, buf.getvalue())
         lines = buf.getvalue().splitlines()
         self.receipt = buf.getvalue()
@@ -735,14 +735,14 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
         self.assertEqual(data["status"], "ok")
         self.assertGreater(data["duration_s"], 1.5)
 
-    def hold_slot(self, stack, mode, onto=None, *, shadow=False):
+    def hold_slot(self, stack, mode):
         d = cc.new_run_directory("codex")
-        meta = dict(task_id=d.name, mode=mode, shadow=shadow)
-        cc.slot(stack, d, meta, self.project, self.project / ".git", onto)
+        meta = dict(task_id=d.name, mode=mode, shadow=False)
+        cc.slot(stack, d, meta, self.project, self.project / ".git")
 
     @contextlib.contextmanager
-    def queued_task(self, *args):
-        cmd = [sys.executable, str(SCRIPT), "run", "--to", "codex", "--model", "synthetic",
+    def queued_task(self, *args, worker="codex"):
+        cmd = [sys.executable, str(SCRIPT), "run", "--to", worker, "--model", "synthetic",
                "--cc-session", str(self.session), "--project-dir", str(self.project), "--task", "x", *args]
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
             try:
@@ -768,6 +768,11 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
                 self.hold_slot(stack, "ro")
             pool = cc.home() / "delegate-runs" / ".locks"
             self.assertFalse(pool.exists())
+            for value in ("nonnumeric", "0", "-1"):
+                with self.subTest(value=value), patch.dict(os.environ, CC_DELEGATE_MAX_READERS=value):
+                    for _ in range(5):
+                        self.hold_slot(stack, "ro")
+                    self.assertFalse(pool.exists())
             for _ in range(4):
                 self.hold_slot(stack, "write")
             with self.assertRaisesRegex(cc.Blocked, "repository_writers_busy"):
@@ -803,6 +808,12 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
                     self.assertFalse(result["shadow"])
                     if onto:
                         self.assertEqual(result["base_sha"], new_head)
+                        self.assertEqual(result["onto_before"], new_head)
+                    self.assertGreater(result["wait_s"], 0)
+                    self.assertGreaterEqual(result["duration_s"], result["wait_s"])
+                    self.assertEqual(json.loads((d / "meta.json").read_text())["wait_s"], result["wait_s"])
+                    log = list(cc.records(cc.home() / "delegate-log.jsonl"))[-1]
+                    self.assertEqual(log["wait_s"], result["wait_s"])
 
     def test_slot_timeout_and_zero_wait_keep_busy_reasons(self):
         self.commit_fixture()
@@ -814,8 +825,37 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
                     d, result = self.run_task("--mode", mode, expected=1)
                     self.assertEqual((result["status"], result["reason"]), ("blocked", busy))
                     self.assertEqual('status="queued"' in self.receipt, wait != "0")
+                    if wait == "0":
+                        self.assertEqual(result["wait_s"], 0)
+                    else:
+                        self.assertGreaterEqual(result["wait_s"], float(wait))
                     self.assertFalse((d / "events.jsonl").exists())
                     self.assertFalse(cc.clone_root(self.project).exists())
+
+    def test_final_poll_at_deadline_and_invalid_wait_defaults(self):
+        self.commit_fixture()
+        for value, wait in (("0.25", .25), ("bad", 1800), ("-1", 1800), ("nan", 1800), ("inf", 1800)):
+            with self.subTest(value=value), patch.dict(os.environ, CC_DELEGATE_MAX_READERS="1",
+                    CC_DELEGATE_SLOT_WAIT=value), contextlib.ExitStack() as held, contextlib.ExitStack() as acquired:
+                self.hold_slot(held, "ro")
+                d = cc.new_run_directory("codex")
+                meta = dict(task_id=d.name, mode="ro", shadow=False)
+                clock = 0
+
+                def advance(seconds):
+                    nonlocal clock
+                    if clock == 0:
+                        clock = wait - .05
+                    else:
+                        held.close()
+                        clock += seconds
+
+                with patch.object(cc.time, "monotonic", side_effect=lambda: clock), \
+                        patch.object(cc.time, "sleep", side_effect=advance) as sleep, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    cc.slot(acquired, d, meta, self.project, self.project / ".git")
+                self.assertEqual(sleep.call_count, 2)
+                self.assertEqual(meta["wait_s"], wait)
 
     def test_cancel_queued_task_without_starting_worker(self):
         self.commit_fixture()
@@ -832,34 +872,122 @@ last.write_text(json.dumps(""" + repr(ANSWER) + "))\n")
                 self.assertFalse(cc.clone_root(self.project).exists())
                 self.assertEqual(json.loads((d / "result.json").read_text())["reason"], "cancelled_by_user")
 
-    def test_shadow_bypasses_full_pools_and_redispatch(self):
+    def test_queued_signals_cancel_without_redispatch(self):
+        self.commit_fixture()
+        with patch.dict(os.environ, CC_DELEGATE_MAX_READERS="1", CC_DELEGATE_SLOT_WAIT="10"), \
+                contextlib.ExitStack() as held:
+            self.hold_slot(held, "ro")
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(sig=sig), self.queued_task("--fallback", worker="agy") as (proc, d):
+                    proc.send_signal(sig)
+                    output, _ = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 2, output)
+                    self.assertFalse((d / "events.jsonl").exists())
+                    result = json.loads((d / "result.json").read_text())
+                    self.assertEqual((result["status"], result["reason"]), ("cancelled", "cancelled_by_user"))
+            log = list(cc.records(cc.home() / "delegate-log.jsonl"))
+            self.assertEqual([(row["worker"], row["status"]) for row in log], [("agy", "cancelled")] * 2)
+
+    def test_shadow_reader_bypasses_full_pool_and_environment_redispatch(self):
         self.commit_fixture()
         self.worker("agy", "sys.stdin.read()\nsys.exit(3)")
         self.worker("codex", "sys.stdin.read()\nprint(json.dumps(" + repr(ANSWER) + "))")
         with patch.dict(os.environ, CC_DELEGATE_MAX_READERS="1", CC_DELEGATE_MAX_WRITERS="1",
                         CC_DELEGATE_SLOT_WAIT="0", CC_DELEGATE_AGY_FALLBACK="1"), contextlib.ExitStack() as held:
             self.hold_slot(held, "ro")
-            self.hold_slot(held, "write")
-            d, read = self.run_task("--shadow", "--fallback", worker="agy", expected=2)
+            d, read = self.run_task("--shadow", worker="agy", expected=2)
             self.assertEqual((read["worker"], read["reason"]), ("agy", "worker_failed"))
             self.assertIs(json.loads((d / "meta.json").read_text())["shadow"], True)
-            _, write = self.run_task("--shadow", "--mode", "write")
         log = list(cc.records(cc.home() / "delegate-log.jsonl"))
-        self.assertEqual([(row["task_id"], row["shadow"]) for row in log],
-                         [(read["task_id"], True), (write["task_id"], True)])
+        self.assertEqual([(row["task_id"], row["shadow"]) for row in log], [(read["task_id"], True)])
+
+    def test_shadow_rejects_writes_and_explicit_fallback_before_creating_run(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "feature")
+        argv = ["run", "--to", "codex", "--model", "synthetic", "--project-dir", str(self.project),
+                "--task", "x", "--shadow"]
+        for flags, message in ((["--mode", "write"], "--shadow requires --mode ro"),
+                               (["--mode", "write", "--onto", "feature"], "--shadow requires --mode ro"),
+                               (["--mode", "write", "--workspace", "files"], "--shadow requires --mode ro"),
+                               (["--fallback"], "--shadow cannot be combined with --fallback")):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit) as exit:
+                cc.main(argv + flags)
+            self.assertEqual(exit.exception.code, 2)
+            self.assertIn(message, err.getvalue())
+        self.assertFalse((cc.home() / "delegate-runs").exists())
+        self.assertFalse(cc.clone_root(self.project).exists())
 
     def test_onto_branch_conflict_never_queues(self):
         self.commit_fixture()
         cc.git(self.project, "branch", "feature")
         with patch.dict(os.environ, CC_DELEGATE_MAX_WRITERS="1", CC_DELEGATE_SLOT_WAIT="0.25"), \
                 contextlib.ExitStack() as held:
-            self.hold_slot(held, "write", "feature", shadow=True)
             self.hold_slot(held, "write")
-            for flags in ([], ["--shadow"]):
-                _, result = self.run_task("--mode", "write", "--onto", "feature", *flags, expected=1)
-                self.assertEqual(result["reason"], "onto_branch_busy")
+            with patch.dict(os.environ, CC_DELEGATE_SLOT_WAIT="10"):
+                with self.queued_task("--mode", "write", "--onto", "feature") as (proc, d):
+                    _, result = self.run_task("--mode", "write", "--onto", "feature", expected=1)
+                    self.assertEqual(result["reason"], "onto_branch_busy")
+                    self.assertNotIn('status="queued"', self.receipt)
+                    self.assertFalse(cc.clone_root(self.project).exists())
+                    self.control("cancel", d.name, "--wait", "5")
+                    output, _ = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 2, output)
+            _, result = self.run_task("--mode", "write", "--onto", "feature", expected=1)
+            self.assertEqual(result["reason"], "repository_writers_busy")
+
+    def test_write_preflight_reports_errors_before_queueing(self):
+        cc.git(self.project, "init", "-q", "-b", "main")
+        with patch.dict(os.environ, CC_DELEGATE_MAX_WRITERS="1", CC_DELEGATE_SLOT_WAIT="0.1"), \
+                contextlib.ExitStack() as held:
+            self.hold_slot(held, "write")
+
+            def check(reason, *args):
+                _, result = self.run_task("--mode", "write", *args, expected=1)
+                self.assertEqual(result["reason"], reason)
+                self.assertEqual(result["wait_s"], 0)
                 self.assertNotIn('status="queued"', self.receipt)
+
+            check("write_requires_git_head")
+            self.commit_fixture()
+            check("unknown_onto_branch", "--onto", "missing")
+            check("unknown_base_ref", "--base", "missing")
+            cc.git(self.project, "branch", "feature")
+            cc.git(self.project, "worktree", "add", "-q", str(self.root / "other"), "feature")
+            check("onto_checked_out_elsewhere", "--onto", "feature")
+            cc.git(self.project, "worktree", "remove", str(self.root / "other"))
+            (self.project / "a").write_text("dirty\n")
+            check("checkout_has_uncommitted_changes", "--onto", "feature")
             self.assertFalse(cc.clone_root(self.project).exists())
+
+    def test_write_preflight_rechecks_changes_after_queueing(self):
+        self.commit_fixture()
+        cc.git(self.project, "branch", "feature")
+        with patch.dict(os.environ, CC_DELEGATE_MAX_WRITERS="1", CC_DELEGATE_SLOT_WAIT="10"), \
+                contextlib.ExitStack() as held:
+            self.hold_slot(held, "write")
+            with self.queued_task("--mode", "write", "--onto", "feature") as (proc, d):
+                (self.project / "a").write_text("dirty\n")
+                held.close()
+                output, _ = proc.communicate(timeout=5)
+                self.assertEqual(proc.returncode, 1, output)
+                result = json.loads((d / "result.json").read_text())
+                self.assertEqual(result["reason"], "checkout_has_uncommitted_changes")
+                self.assertFalse(cc.clone_root(self.project).exists())
+
+    def test_cancel_at_slot_admission_does_not_create_clone(self):
+        self.commit_fixture()
+        slot = cc.slot
+
+        def admit_and_cancel(stack, d, *args):
+            slot(stack, d, *args)
+            (d / "cancel.requested").touch()
+
+        with patch.object(cc, "slot", side_effect=admit_and_cancel):
+            d, result = self.run_task("--mode", "write", expected=2)
+        self.assertEqual((result["status"], result["reason"]), ("cancelled", "cancelled_by_user"))
+        self.assertFalse((d / "events.jsonl").exists())
+        self.assertFalse(cc.clone_root(self.project).exists())
 
     def test_breaches_ignore_only_sibling_landings(self):
         state = lambda head, refs, branch="refs/heads/feature": {

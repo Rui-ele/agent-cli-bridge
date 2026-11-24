@@ -135,7 +135,7 @@ python3 "$delegate" rollback TASK_ID
 - `CC_DELEGATE_SDK_PYTHON` 指向的解释器以宿主权限运行。请指向你自己创建并信任的环境，避免使用待审项目里的 `.venv`。
 - **发出去的上下文**：默认 `--context none`，只发任务文本和固定规则。`--include FILE` 只附上文件的路径和开头几行，接单方需要时会自己去读全文。由 CC 发起时，显式用 `--context scoped|session|full` 可带上 CC 对话，默认选该项目最新的 CC 会话。由 Codex 发起时，按上节选取 Codex 会话。两者打包前都会脱敏常见的密钥格式，普通业务内容会保留。
 - **只读和写入**：`--mode ro` 限制接单方修改项目文件。Claude 需要在 `~/.claude/projects/<项目>/` 写入自己的会话记录，因此只读任务也能改动该目录下其他 CC 会话的记录。默认的 Git 写入模式在项目旁边的 `../.wt-delegate/<task_id>` 建一个独立克隆，接单方只在克隆里改，你的工作区和分支不会被直接改动。结束后，脚本把提交取回主仓库的 `delegate/<task_id>` 分支；加了 `--onto <已有功能分支>` 时，还会把该分支快进到这个提交。不能是快进、该分支在别的 worktree 里检出、或者 `main`/`master` 时，脚本拒绝移动分支。回执里给出 `rollback` 回退命令。
-- **并发名额**。同一仓库默认允许 4 个写入任务同时运行，只读任务默认不限。名额满时，`run` 会输出任务号和 `status="queued"`。排队中可用 `status` 查看、用 `cancel` 取消。拿到名额后才创建克隆或工作区并启动接单方。默认最多等 30 分钟，超时返回 `repository_readers_busy` 或 `repository_writers_busy`。目标分支已被另一个 `--onto` 任务锁定时立即返回 `onto_branch_busy`。`--workspace files` 的同目录写入冲突仍立即返回 `files_workspace_busy`。
+- **并发名额**。同一仓库默认允许 4 个写入任务同时运行，只读任务默认不限。名额满时，`run` 会输出任务号和 `status="queued"`。可以用 `status` 查看排队状态，用 `cancel` 或 Ctrl-C 取消。排队不保证先到先得。拿到名额后才创建克隆或工作区并启动接单方。默认最多等 30 分钟，到期仍无名额就返回 `repository_readers_busy` 或 `repository_writers_busy`。带 `--onto` 的任务在取号前就独占目标分支，冲突时立即返回 `onto_branch_busy`。`--workspace files` 的同目录写入冲突仍立即返回 `files_workspace_busy`。
 - **Claude 的登录过期后，沙箱里刷新不了**：`--to claude` 在沙箱里运行，过期的登录令牌没法自动刷新，委托会报 401（`OAuth access token has expired`）。在终端里直接运行一次 `claude -p "say ok"` 刷新登录，再重新委托即可。原因推测是刷新要写钥匙串，被沙箱挡住了，未核实。
 - **沙箱只管写，不管读和联网**：接单方能读到你账号能读的所有文件，也能联网。含密钥或凭据的仓库，建议只交给你信任的接单方，或者不要委托。
 - **失败改派默认关闭**：agy 失败或卡死时，可以自动改派给 Codex 重跑，用 `--fallback` 或环境变量 `CC_DELEGATE_AGY_FALLBACK=1` 开启。开启后材料会发给另一家，也会多花一份额度。
@@ -144,6 +144,8 @@ python3 "$delegate" rollback TASK_ID
   - `~/.claude/delegate-runs/<task_id>/`：发出去的完整任务包、事件流、回执和报告；
   - `~/.claude/delegate-log.jsonl`：记账；
   - Git 写入任务另有 `../.wt-delegate/` 下的克隆，以及主仓库里的 `delegate/<task_id>` 分支。
+
+  任务元数据和记账中的 `wait_s` 是等待名额的秒数，未排队时为 `0`。`duration_s` 是从发起到结束的总秒数，包含排队时间。
 
   用 `prune --dry-run` 查看可以清理的内容，确认后再去掉 `--dry-run`。默认只清结束超过 7 天的；有未提交改动、或有未合并提交的克隆和分支会保留。索引含 `assume-unchanged` 或 `skip-worktree` 条目时也会保留克隆，因为 Git 可能跳过这些文件的改动。宿主检查克隆和取回提交时，每条 Git 命令默认限时 60 秒，可用 `CC_DELEGATE_GIT_TIMEOUT` 设置正整数秒数。检查超时会保留克隆。有写入任务在跑时不要清理。
 
@@ -154,7 +156,7 @@ python3 "$delegate" rollback TASK_ID
 | 命令 | 作用 |
 | --- | --- |
 | `run …` | 发起委托（参数见 `run --help`） |
-| `run … --shadow` | 发起影子任务，跳过仓库名额并关闭失败改派。继续遵守 `--onto` 分支锁和普通文件夹的写入锁，任务元数据和记账标记 `shadow: true` |
+| `run … --shadow` | 发起只读影子任务，跳过仓库名额并关闭失败改派。与 `--mode write`、`--fallback` 互斥。任务元数据和记账标记 `shadow: true` |
 | `status <task_id>` | 查看排队状态、运行中任务的最近命令和消息，或已完成任务的回执 |
 | `cancel <task_id>` | 取消任务 |
 | `steer <task_id> --message '…'` | Codex daemon 中途插话；Claude SDK 立即提交一条消息，由 Claude 决定在哪一轮采纳 |
