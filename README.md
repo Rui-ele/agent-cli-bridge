@@ -18,7 +18,7 @@ Claude Code（CC）和 Codex 都可以把代码审阅、调研或修改任务交
 
 - **macOS**。脚本用到 `fcntl`，原生 Windows 跑不了。`--to claude` 和 agy 的 ACP 后端靠 macOS 自带的 `/usr/bin/sandbox-exec` 限制写入，Linux 上会以 `os_sandbox_unavailable` 拒绝；Linux 上只能用 `--to codex` 和 `--to agy --backend exec`。
 - **Python 3.10 或更高**。macOS 自带的 `/usr/bin/python3` 是 3.9，跑不了（脚本会提示版本不够并退出）。没有开发工具的 Mac，最简单的是从 [python.org](https://www.python.org/downloads/macos/) 下载安装包；装过 Homebrew 的可以 `brew install python`。装完新开一个终端，`python3 --version` 应显示 3.10 或更高。
-- **git**。写入任务要求项目是 git 仓库。
+- **git**。默认写入模式要求仓库有至少一个提交。普通文件夹使用下文的 `--workspace files`。
 - **至少一个接单方的 CLI，已装好并登录**：
   - Codex：`codex`，安装见 [Codex CLI 文档](https://developers.openai.com/codex/cli)；
   - agy：`agy`，安装见 [Antigravity CLI 安装说明](https://antigravity.google/docs/cli/install)；
@@ -96,6 +96,35 @@ SDK 回执的 token 用量按本次任务内的各轮累加，`cost_usd` 来自 
 
 Codex 默认只发送任务和显式指定的文件摘录。要带当前对话，加 `--context scoped`（最近三轮）或 `session`（对话和裁剪过的 shell 记录）。`full` 保留这些 shell 命令的输出，仍受上下文预算和脱敏规则限制。脚本按当前 `CODEX_THREAD_ID` 定位会话，也可用 `--codex-session FILE` 显式指定 rollout。支持的记录是用户消息、助手消息和已完成的 shell 命令；旧格式只有对话消息时只带消息。续接时沿用 worker 的历史。
 
+## 暂存普通文件夹的修改
+
+假设要整理一份笔记，可以让接单方先修改副本。脚本默认不写回原文件夹，也不会在里面创建 `.git`。
+
+```sh
+delegate=~/.claude/tools/cc-delegate/cc_delegate.py
+python3 "$delegate" run --to codex --model gpt-6.2-astra \
+  --mode write --workspace files --project-dir ~/notes \
+  --task '统一笔记标题格式，保留正文。'
+```
+
+用回执里的任务号替换下面的 `TASK_ID`。回执列出新增、删除和修改的相对路径，`report_path` 指向包含文本 diff 的报告。二进制或超过 1 MiB 的文件列出大小和 SHA-256。
+
+```sh
+python3 "$delegate" status TASK_ID
+python3 "$delegate" apply TASK_ID
+python3 "$delegate" rollback TASK_ID
+```
+
+`status` 的 `workspace_phase` 显示运行中（`running`）、待写回（`pending_apply`）、已写回（`applied`）或已回退（`rolled_back`）。`apply` 在目录锁内核对全部受影响路径，发现冲突会列出路径并整批停止。通过后先备份原件，再逐项删除或用同目录临时文件原子替换。`rollback` 同样先检查全部路径，遇到写回后的用户编辑就停止。
+
+原子替换按文件生效。如果写回期间其他应用又修改或锁住文件，前面完成的项目会保留。解除占用、解决冲突后，可重跑同一条 `apply` 或 `rollback` 命令，脚本会根据进度日志继续。原子替换可能丢失 macOS 扩展属性和 Finder 标签。
+
+每份任务的副本、基线清单、差异、备份和进度日志都在私有运行目录中。同卷且支持 APFS 克隆时使用写时复制，其他情况按字节复制。同一个目标目录同时只允许一个写入任务。待写回的工作区会被 `prune` 保留。决定放弃时运行 `mark TASK_ID --outcome discarded`。已写回、已回退或已放弃的工作区可以按默认七天规则清理，清理备份后即无法再用该任务回退。
+
+第一版按整目录处理普通文件，不接收 `--include`、`--base`、`--onto` 或 `--resume`。Git 仓库及其子目录沿用默认分支交付。空目录和目录权限不单独交付。符号链接、硬链接、特殊文件、嵌套的 `.git` 和命中敏感路径规则的文件会使任务停止。为兼容不同文件系统，路径须使用 UTF-8，不支持仅大小写或 Unicode 规范形式不同的异名，以及文件与目录互换。默认文件数和目录数各最多 10,000，总大小最多 1 GiB，可通过 `CC_DELEGATE_FILES_MAX_COUNT`、`CC_DELEGATE_FILES_MAX_BYTES` 调整。
+
+普通文件夹容易混有私人资料，委托前请核对整个目录的内容。沙箱只限制写入，接单方仍能读取工作区以外的文件。Codex 使用原生工作区沙箱，agy 和 Claude 的两种后端都要求 macOS Seatbelt，并把临时主目录和运行时状态放在任务的 `scratch/`。依赖原主目录状态的登录方式可能需要改用 CLI 支持的环境变量认证。
+
 ## 默认行为和边界
 
 请在用于工作材料之前读完这一节。
@@ -103,7 +132,7 @@ Codex 默认只发送任务和显式指定的文件摘录。要带当前对话�
 - 同一系统用户下的其他会话也能凭 `task_id` 控制任务。
 - `CC_DELEGATE_SDK_PYTHON` 指向的解释器以宿主权限运行。请指向你自己创建并信任的环境，避免使用待审项目里的 `.venv`。
 - **发出去的上下文**：默认 `--context none`，只发任务文本和固定规则。`--include FILE` 只附上文件的路径和开头几行，接单方需要时会自己去读全文。由 CC 发起时，显式用 `--context scoped|session|full` 可带上 CC 对话，默认选该项目最新的 CC 会话。由 Codex 发起时，按上节选取 Codex 会话。两者打包前都会脱敏常见的密钥格式，普通业务内容会保留。
-- **只读和写入**：`--mode ro` 限制接单方修改项目文件。Claude 需要在 `~/.claude/projects/<项目>/` 写入自己的会话记录，因此只读任务也能改动该目录下其他 CC 会话的记录。`--mode write` 在项目旁边的 `../.wt-delegate/<task_id>` 建一个独立克隆，接单方只在克隆里改，你的工作区和分支不会被直接改动。结束后，脚本把提交取回主仓库的 `delegate/<task_id>` 分支；加了 `--onto <已有功能分支>` 时，还会把该分支快进到这个提交。不能是快进、该分支在别的 worktree 里检出、或者 `main`/`master` 时，脚本拒绝移动分支。回执里给出 `rollback` 回退命令。
+- **只读和写入**：`--mode ro` 限制接单方修改项目文件。Claude 需要在 `~/.claude/projects/<项目>/` 写入自己的会话记录，因此只读任务也能改动该目录下其他 CC 会话的记录。默认的 Git 写入模式在项目旁边的 `../.wt-delegate/<task_id>` 建一个独立克隆，接单方只在克隆里改，你的工作区和分支不会被直接改动。结束后，脚本把提交取回主仓库的 `delegate/<task_id>` 分支；加了 `--onto <已有功能分支>` 时，还会把该分支快进到这个提交。不能是快进、该分支在别的 worktree 里检出、或者 `main`/`master` 时，脚本拒绝移动分支。回执里给出 `rollback` 回退命令。
 - **Claude 的登录过期后，沙箱里刷新不了**：`--to claude` 在沙箱里运行，过期的登录令牌没法自动刷新，委托会报 401（`OAuth access token has expired`）。在终端里直接运行一次 `claude -p "say ok"` 刷新登录，再重新委托即可。原因推测是刷新要写钥匙串，被沙箱挡住了，未核实。
 - **沙箱只管写，不管读和联网**：接单方能读到你账号能读的所有文件，也能联网。含密钥或凭据的仓库，建议只交给你信任的接单方，或者不要委托。
 - **失败改派默认关闭**：agy 失败或卡死时，可以自动改派给 Codex 重跑，用 `--fallback` 或环境变量 `CC_DELEGATE_AGY_FALLBACK=1` 开启。开启后材料会发给另一家，也会多花一份额度。
@@ -111,7 +140,7 @@ Codex 默认只发送任务和显式指定的文件摘录。要带当前对话�
 - **本机会留下的东西**：
   - `~/.claude/delegate-runs/<task_id>/`：发出去的完整任务包、事件流、回执和报告；
   - `~/.claude/delegate-log.jsonl`：记账；
-  - 写入任务另有 `../.wt-delegate/` 下的克隆，以及主仓库里的 `delegate/<task_id>` 分支。
+  - Git 写入任务另有 `../.wt-delegate/` 下的克隆，以及主仓库里的 `delegate/<task_id>` 分支。
 
   用 `prune --dry-run` 查看可以清理的内容，确认后再去掉 `--dry-run`。默认只清结束超过 7 天的；有未提交改动、或有未合并提交的克隆和分支会保留。索引含 `assume-unchanged` 或 `skip-worktree` 条目时也会保留克隆，因为 Git 可能跳过这些文件的改动。宿主检查克隆和取回提交时，每条 Git 命令默认限时 60 秒，可用 `CC_DELEGATE_GIT_TIMEOUT` 设置正整数秒数。检查超时会保留克隆。有写入任务在跑时不要清理。
 

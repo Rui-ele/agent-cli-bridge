@@ -425,7 +425,7 @@ class Piece:
     condensed: str = ""
 
 
-def package(task, messages, includes, tier, mode, size, caller="claude"):
+def package(task, messages, includes, tier, mode, size, caller="claude", workspace=None):
     redactions = 0
 
     def clean(value):
@@ -453,6 +453,8 @@ def package(task, messages, includes, tier, mode, size, caller="claude"):
 
     sender = "Codex" if caller == "codex" else "Claude Code（CC）"
     pieces = [Piece("header", HEADER.format(sender=sender) + f"\n执行模式：{mode}")]
+    if workspace == "files":
+        pieces[0].text += "\n当前目录是普通文件夹的暂存副本。直接编辑其中的文件，宿主会生成差异并负责写回。请勿创建 .git。"
     # Includes are files the caller chose, not conversation, so even the "none" tier names them.
     for p in includes:
         p = safe_file(p)
@@ -1142,10 +1144,19 @@ class Driver:
     def prepare_files(self, cwd, run_dir, mode, repo):
         pass
 
-    def environment(self, writable):
+    def environment(self, writable, workspace=None):
         env = dict(os.environ, CC_DELEGATE_DEPTH=str(delegation_depth() + 1))
         if writable:
             env["TMPDIR"] = str(writable[-1])
+        if workspace == "files" and self.executable in ("agy", "claude"):
+            # Keep CLI state writable without opening the caller's home or shared temp.
+            scratch = writable[-1]
+            env["HOME"] = str(scratch)
+            for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME",
+                        "XDG_RUNTIME_DIR"):
+                env.pop(key, None)
+            if self.executable == "claude":
+                env["CLAUDE_CONFIG_DIR"] = str(scratch / ".claude")
         return env
 
     def encode_prompt(self, prompt):
@@ -1340,11 +1351,19 @@ class AgyPrint(AgyDriver):
 
     def command(self, args, cwd, run_dir, writable):
         schema = str(run_dir / "schema.json")
+        files = getattr(args, "workspace", None) == "files"
+        log_dir = writable[-1] if files else run_dir
         cmd = ["agy", "--input-format", "stream-json", "--output-format", "stream-json", "--model",
                args.model, "--json-schema", schema, "--disable-slash-commands", "--mode",
                "plan" if args.mode == "ro" else "accept-edits", "--settings", str(run_dir / "settings.json"),
-               "--print-timeout", "0", "--log-file", str(run_dir / self.activity_log)]
-        if args.mode == "write":
+               "--print-timeout", "0", "--log-file", str(log_dir / self.activity_log)]
+        if files:
+            if not seatbelt_available():
+                raise Blocked("os_sandbox_unavailable")
+            profile = run_dir / "sandbox.sb"
+            save_text(profile, files_seatbelt_profile(cwd, writable))
+            cmd = [str(SEATBELT), "-f", str(profile), *cmd]
+        elif args.mode == "write":
             cmd.append("--sandbox")
         else:
             # Let agy read included files that live outside the workspace (plan mode soft-denies them).
@@ -1417,6 +1436,10 @@ def seatbelt_available():
     return sys.platform == "darwin" and SEATBELT.is_file() and os.access(SEATBELT, os.X_OK)
 
 
+def files_seatbelt_profile(cwd, writable):
+    return seatbelt_profile("write", cwd, writable, (), shared_temp=False)
+
+
 class SeatbeltDriver(Driver):
     def check_available(self):
         if not seatbelt_available():
@@ -1430,7 +1453,9 @@ class AgyAcp(SeatbeltDriver, AgyDriver, ItemEventDriver):
 
     def command(self, args, cwd, run_dir, writable):
         profile = run_dir / "sandbox.sb"
-        save_text(profile, seatbelt_profile(args.mode, cwd, writable, ["~/.gemini"]))
+        rules = (files_seatbelt_profile(cwd, writable) if getattr(args, "workspace", None) == "files"
+                 else seatbelt_profile(args.mode, cwd, writable, ["~/.gemini"]))
+        save_text(profile, rules)
         cmd = [sys.executable, str(Path(__file__).resolve()), "acp-worker",
                "--cwd", str(cwd), "--mode", args.mode, "--agent-mode",
                "plan" if args.mode == "ro" else "accept-edits", "--model", args.model,
@@ -1455,10 +1480,10 @@ class ClaudePrint(SeatbeltDriver):
     def window(self, model):
         return (1_000_000 if model.endswith("[1m]") else 200_000), True
 
-    def environment(self, writable):
+    def environment(self, writable, workspace=None):
         # A parent CC session exports its ID, message sockets and CLAUDE_CODE_SIMPLE=1.
         # Keep the provider and login choices so the child can use the same account.
-        env = super().environment(writable)
+        env = super().environment(writable, workspace)
         for key in list(env):
             if key.startswith("CLAUDE_CODE_USE_") or key == "CLAUDE_CODE_OAUTH_TOKEN":
                 continue
@@ -1470,6 +1495,8 @@ class ClaudePrint(SeatbeltDriver):
         return env
 
     def profile_text(self, args, cwd, run_dir, writable):
+        if getattr(args, "workspace", None) == "files":
+            return files_seatbelt_profile(cwd, writable)
         config = Path(cwd) / Path(os.getenv("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser()
         dirs = [config / name for name in self.state_dirs]
         dirs.append(config / "projects" / claude_project_name(cwd))
@@ -2202,6 +2229,18 @@ def lock(stack, path, blocking=False, *, create=True):
     return True
 
 
+def files_lock(stack, project):
+    # Directory aliases and callers using different run homes must share the same lease.
+    fd = os.open(project, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    stack.callback(os.close, fd)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Blocked("files_workspace_busy") from None
+    info = os.fstat(fd)
+    return [info.st_dev, info.st_ino]
+
+
 def delegation_depth():
     return max(0, int(os.getenv("CC_DELEGATE_DEPTH", "0")))
 
@@ -2510,7 +2549,11 @@ def receipt(data):
         data = dict(data, fallback="agy 失败，已自动改派 Codex")
         flags += ["fallback", "fallback_from", "fallback_reason"]
     row(*flags, limit=320)
-    if data.get("mode") == "write":
+    if data.get("workspace") == "files":
+        row("workspace", "workspace_phase")
+        for kind, paths in data.get("file_changes", {}).items():
+            print(field(kind, paths))
+    elif data.get("mode") == "write":
         extra = [field("onto", data["onto"]), field("rollback", data.get("rollback"))] if data.get("onto") else []
         print(field("changed_files", data["changed_files"], 400), field("worktree", data["worktree"]), *extra)
     row("report_path")
@@ -2534,7 +2577,8 @@ def worker_attempt(driver, args, cwd, d, writable, repo, prompt, meta, finish):
         # Cleaning up a failed startup must leave the next attempt interruptible.
         with (run_interrupts() if driver.fallback_backend else nullcontext(finish)) as finish_attempt:
             rc, stalled = supervise(cmd, cwd, d, prompt, meta, stall, events, finish_attempt,
-                                    driver.environment(writable), getattr(args, "sdk_fds", ()))
+                                    driver.environment(writable, getattr(args, "workspace", None)),
+                                    getattr(args, "sdk_fds", ()))
         if driver.backend == "sdk" and not events.saw_result and not events.error:
             events.error = "sdk_worker_missing_terminal_result"
         if (driver.fallback_backend and rc == driver.unavailable_exit
@@ -2565,6 +2609,15 @@ def new_run_directory(worker):
 
 def run(args, driver, quiet=False):
     depth_exceeded = delegation_depth() >= int(os.getenv("CC_DELEGATE_MAX_DEPTH", "2"))
+    files_mode = getattr(args, "workspace", None) == "files"
+    project_arg = Path(args.project_dir).expanduser()
+    project = project_arg.resolve()
+    if files_mode:
+        import file_workspace
+
+        runs = (home() / "delegate-runs").resolve()
+        if runs.is_relative_to(project) or project.is_relative_to(runs):
+            raise Blocked("files_workspace_overlaps_run_directory")
     try:
         d = new_run_directory(args.to)
     except PermissionError:
@@ -2573,7 +2626,6 @@ def run(args, driver, quiet=False):
             raise Blocked("delegation_depth_exceeded")
         raise
     task_id = d.name
-    project = Path(args.project_dir).expanduser().resolve()
     start = time.monotonic()
     tier = "none" if args.resume else args.context
     meta = dict(fallback_from=getattr(args, "fallback_from", None),
@@ -2585,6 +2637,8 @@ def run(args, driver, quiet=False):
                 started_at=now(), duration_s=None, cc_session=None, cc_cost_before=None,
                 cc_cost_after=None, outcome=None, note=None, package_tokens_est=None,
                 redactions=0, loop_warning=False, exit_code=None, report_path=str(d / "report.md"))
+    if files_mode:
+        meta.update(workspace="files", workspace_phase="running")
     driver = select_driver(args, driver, meta)
     worktree = events = None
     reply = dict(summary=[], uncertainties=[], report_markdown="")
@@ -2608,6 +2662,18 @@ def run(args, driver, quiet=False):
                     raise Blocked("base_requires_write_mode")
             if not project.is_dir():
                 raise Blocked("project_dir_missing")
+            if files_mode:
+                if args.mode != "write":
+                    raise Blocked("files_workspace_requires_write_mode")
+                if args.onto is not None or args.base is not None or args.resume or args.include:
+                    raise Blocked("files_workspace_uses_whole_folder_without_base_onto_resume_or_include")
+                if project_arg.is_symlink() or sensitive(project_arg, directory=True) or sensitive(project, directory=True):
+                    raise Blocked("files_workspace_refused_project_path")
+                meta["project_identity"] = files_lock(stack, project)
+                if git(project, "rev-parse", "--git-dir", check=False):
+                    raise Blocked("files_workspace_requires_non_git_directory")
+                if isinstance(driver, AgyPrint) and not seatbelt_available():
+                    raise Blocked("os_sandbox_unavailable")
             driver.check_available()
             if driver.backend == "sdk":
                 args.sdk_python = driver.interpreter()
@@ -2624,11 +2690,12 @@ def run(args, driver, quiet=False):
             size, estimated = driver.window(args.model)
             meta.update(context_window=size, window_estimated=estimated)
             files = [project / Path(p).expanduser() for p in args.include]
-            prompt, count = package(task, messages, files, tier, args.mode, size, args.caller)
+            prompt, count = package(task, messages, files, tier, args.mode, size, args.caller,
+                                    getattr(args, "workspace", None))
             meta.update(package_tokens_est=math.ceil(len(prompt)/3), redactions=count)
             save_text(d / "package.md", prompt)
             save_json(d / "schema.json", SCHEMA)
-            repo = git(project, "rev-parse", "--show-toplevel", check=False).removesuffix("\n")
+            repo = None if files_mode else git(project, "rev-parse", "--show-toplevel", check=False).removesuffix("\n")
             common = None
             cwd = project
             if repo:
@@ -2639,7 +2706,18 @@ def run(args, driver, quiet=False):
                 args.source_paths = (Path(repo), common) if repo else (project,)
                 if args.mode == "ro":
                     writable = (Path(stack.enter_context(tempfile.TemporaryDirectory(dir=d, prefix="tmp-"))),)
-            if args.mode == "write":
+            if files_mode:
+                args.source_paths = (project,)
+                cwd, scratch = d / "work", d / "scratch"
+                writable = (scratch,)
+                try:
+                    file_workspace.prepare(project, d, sensitive, dry_run=args.dry_run)
+                except file_workspace.WorkspaceError as error:
+                    raise Blocked(str(error)) from error
+                if not args.dry_run:
+                    scratch.mkdir(mode=0o700)
+                    meta["worktree"] = str(cwd)
+            elif args.mode == "write":
                 if not repo or not meta["base_sha"]:
                     raise Blocked("write_requires_git_head")
                 if args.onto:
@@ -2668,7 +2746,7 @@ def run(args, driver, quiet=False):
                 cwd = area / task_id
                 gitdir, scratch = area / f".git-{task_id}", area / f".tmp-{task_id}"
                 writable = (gitdir, scratch)
-            if not args.dry_run:
+            if not files_mode and not args.dry_run:
                 slot(stack, project, common, args.mode, args.onto)
                 if args.mode == "write":
                     with ExitStack() as publish:
@@ -2732,7 +2810,17 @@ def run(args, driver, quiet=False):
             reply["uncertainties"].append("group_cleanup_unconfirmed")
         with ExitStack() as publish:
             publish_error = None
-            if worktree:
+            if files_mode:
+                meta["workspace_phase"] = "unavailable"
+                if meta["worktree"]:
+                    try:
+                        changes, diff_path = file_workspace.compare(d, sensitive,
+                                                                    report_prefix=reply["report_markdown"])
+                        paths = sorted(path for group in changes.values() for path in group)
+                        meta.update(file_changes=changes, changed_files=paths, workspace_phase="pending_apply")
+                    except (OSError, ValueError) as error:
+                        publish_error = error
+            elif worktree:
                 try:
                     # Sibling write tasks fetch and land into the same repository; one at a time.
                     lock(publish, common / "cc-delegate-publish.lock", blocking=True)
@@ -2777,7 +2865,12 @@ def run(args, driver, quiet=False):
         meta.update(duration_s=round(time.monotonic()-start, 3), finished_at=now())
         if events is not None:
             meta.update(events.driver.receipt_fields(meta, events))
-        save_text(d / "report.md", reply["report_markdown"])
+            if files_mode:
+                meta.pop("resume_command", None)
+        if meta.get("workspace_phase") == "pending_apply":
+            os.replace(diff_path, d / "report.md")
+        else:
+            save_text(d / "report.md", reply["report_markdown"])
         meta.update(summary=reply["summary"], uncertainties=reply["uncertainties"])
         save_json(d / "meta.json", meta)
         save_json(d / "result.json", meta)
@@ -3026,6 +3119,8 @@ def preview(value, limit):
 
 
 def running_status(d, meta):
+    if meta.get("workspace") == "files":
+        print('workspace="files" workspace_phase="running"')
     if meta.get("backend") == "sdk" and sdk_supervisor_exited(d):
         print(f'task_id={d.name} status="outcome_unknown" reason="sdk_supervisor_exited"')
         return
@@ -3058,14 +3153,32 @@ def existing(args):
         cancel(d, args.wait)
         return 0
     with ExitStack() as stack:
-        if args.command == "mark":
+        if args.command in ("mark", "apply", "rollback"):
             lock(stack, d / ".result.lock", blocking=True)
         result = d / "result.json"
-        if args.command == "mark" and not result.is_file():
+        if args.command in ("mark", "apply", "rollback") and not result.is_file():
             raise Blocked("task_still_running")
         finished = result.is_file()
         data = json.loads((result if finished else d / "meta.json").read_text())
-        if args.command == "mark":
+        if data.get("workspace") == "files":
+            import file_transaction
+
+            data["workspace_phase"] = file_transaction.phase(d, data["workspace_phase"])
+        if args.command in ("apply", "rollback"):
+            if data.get("workspace") != "files":
+                raise Blocked("requires_files_workspace")
+            if data["workspace_phase"] in ("unavailable", "running"):
+                raise Blocked("files_workspace_not_ready")
+            if data.get("outcome") == "discarded" and data["workspace_phase"] == "pending_apply":
+                raise Blocked("files_workspace_discarded")
+            project = Path(data["project_dir"])
+            if files_lock(stack, project) != data["project_identity"]:
+                raise Blocked("files_project_directory_replaced")
+            data["workspace_phase"] = file_transaction.transact(d, data, args.command)
+            save_json(d / "meta.json", data)
+            save_json(result, data)
+            print(f'{d.name} workspace_phase={dumps(data["workspace_phase"])}')
+        elif args.command == "mark":
             data["context"] = data.get("effective_context", data.get("context"))
             if data.setdefault("caller", "claude") == "claude":
                 selector = args.cc_session or data.get("cc_session")
@@ -3198,6 +3311,23 @@ def prune_run(d, cutoff, dry_run, counts, kept, kept_clones, unsafe):
             # A crashed supervisor cannot timestamp its exit. Age the run by its last recorded activity.
             if max(p.stat().st_mtime for p in (metadata, d / "events.jsonl") if p.is_file()) >= cutoff:
                 return False
+        if meta.get("workspace") == "files":
+            import file_transaction
+
+            # A supervisor can exit after committing the journal and before publishing the receipt.
+            journal = d / file_transaction.JOURNAL_NAME
+            if journal.exists() and journal.stat().st_mtime >= cutoff:
+                return False
+            phase = file_transaction.phase(d, meta["workspace_phase"])
+            discarded = result.is_file() and json.loads(result.read_text()).get("outcome") == "discarded"
+            unfinished = phase == "pending_apply" or (phase in ("running", "unavailable") and (d / "work").exists())
+            if phase in ("applying", "rolling_back") or (unfinished and not discarded):
+                kept_clones.append(dict(task_id=d.name, reason=phase))
+                return False
+            if not dry_run:
+                shutil.rmtree(d)
+            counts["runs"] += 1
+            return True
         project = Path(meta["project_dir"])
         worktree = meta["worktree"]
         if not project.is_absolute() or (worktree is not None and not isinstance(worktree, str)):
@@ -3293,6 +3423,7 @@ def main(argv=None):
     r.add_argument("--codex-session", metavar="FILE",
                    help="Codex caller transcript for requested context (default: current CODEX_THREAD_ID)")
     r.add_argument("--project-dir", default=".")
+    r.add_argument("--workspace", choices=("files",), help="stage an entire ordinary folder for explicit apply")
     r.add_argument("--include", nargs="+", action="extend", default=[])
     r.add_argument("--mode", choices=("ro", "write"), default="ro")
     r.add_argument("--search", action="store_true")
@@ -3315,7 +3446,8 @@ def main(argv=None):
     p = commands.add_parser("prune")
     p.add_argument("--older-than", type=nonnegative, default=7, metavar="DAYS")
     p.add_argument("--dry-run", action="store_true")
-    commands.add_parser("status").add_argument("task_id")
+    for name in ("status", "apply", "rollback"):
+        commands.add_parser(name).add_argument("task_id")
     commands.add_parser("finish").add_argument("task_id")
     s = commands.add_parser("steer")
     s.add_argument("task_id")
